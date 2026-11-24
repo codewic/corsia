@@ -124,7 +124,7 @@ The hard disk sits on a USB 2.0 port. `corsia lanes` points out that its enclosu
 
 ## Build
 
-Linux 5.6 or later (io_uring), Rust stable.
+Linux 5.6 or later (io_uring), Rust stable (1.85 or later). Step-by-step instructions are in [docs/quick-start.md](docs/quick-start.md).
 
 ```bash
 cargo build --release
@@ -136,6 +136,7 @@ cargo build --release --manifest-path watch/Cargo.toml   # for corsia watch
 
 ## Guides
 
+- [Install and quick start](docs/quick-start.md): from nothing to a model served from two drives, with what each step writes to your disks.
 - [Choosing the right model file for your CPU](docs/choosing-a-model-file.md): why the weight format inside a model file can matter more than its size, and how to tune a file for the machine it runs on (+11% on a 2011 laptop at the same quality).
 - [Remote experts](docs/remote-experts.md): a design for keeping experts in another machine's memory.
 - [Contributing](CONTRIBUTING.md): how to report results and send changes.
