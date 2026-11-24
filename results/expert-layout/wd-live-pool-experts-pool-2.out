@@ -1,0 +1,22 @@
+Results go to ~/.cache/corsia-build/stream-20261123-184457.log
+this checkout already has the Corsia changes (fork branch or patched earlier)
+== Cap 6 GiB, model 11 GiB, 32 tokens, CORSIA_POOL_MIB=3584
+== llama.cpp: -c 2048 -fa on -ctk q8_0 -ctv q8_0 -b 256 -ub 256
+== stream
+0.00.191.580 I corsia: streaming experts for 48 layers through /run/user/1000/corsia/Qwen3-30B-A3B-UD-Q2_K_XL.gguf.sock; guessing ahead off (48 routers, top 8 + 0)
+0.39.209.563 I corsia: expert pool warmed from ~/.cache/corsia/Qwen3-30B-A3B-UD-Q2_K_XL.gguf.pool-profile: 1935 experts, 3242 MiB in 39.0 s
+0.39.209.651 I corsia: expert pool of 1935 slots (1.9 MiB each): experts are read straight into it, not through the page cache
+0.39.209.660 I corsia: residency-aware routing on: up to 2 experts per layer swapped for runners-up already in memory (score ratio 0.50, within 8 places)
+0.39.209.683 I corsia: 2 compute threads; a waiting thread spins 10000 times before it sleeps
+3.37.440.249 I common_perf_print:        load time =   38208.29 ms
+3.37.440.251 I common_perf_print: prompt eval time =   38207.86 ms /    10 tokens ( 3820.79 ms per token,     0.26 tokens per second)
+3.37.440.253 I common_perf_print:        eval time =   31094.96 ms /    31 runs   ( 1003.06 ms per token,     1.00 tokens per second)
+3.37.554.439 I corsia: swapped 1502 experts for ones already in memory; 582 of 1153 layers that had a missing expert did not wait for the drives
+3.37.557.575 I corsia: expert pool: 1935 slots of 1.9 MiB, 11862 of 13777 chosen experts already there (86%), 3094 MiB read into it, 64 experts (113 MiB) copied in from guesses, 144 tensors pointed at it
+heat: Corsia 42.2 CPU seconds (18.0 user, 24.2 system)
+heat: workingset_refault_file 195714
+heat: pgfault 1260389
+heat: pgmajfault 785
+heat: 111.5 CPU seconds in 223.1 s (53.2 user, 58.3 system)
+heat: package peak 73 C, mean 56 C
+Done. Compare the 'eval time ... tokens per second' lines above (full output in ~/.cache/corsia-build/stream-20261123-184457.log).

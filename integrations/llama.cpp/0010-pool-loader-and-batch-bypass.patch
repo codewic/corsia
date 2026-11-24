@@ -1,0 +1,583 @@
+From cf6944b01ead8307d6924e7fc4b93a7a28f544de Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:04:45 +0000
+Subject: [PATCH] Pool: opt-in background loader, prompt batches fetched
+ outside the pool
+
+---
+ common/corsia-experts.h |  28 +++-
+ common/corsia-pool.h    | 290 +++++++++++++++++++++++++++++++---------
+ src/corsia-client.h     |  36 +++--
+ 3 files changed, 276 insertions(+), 78 deletions(-)
+
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index 771788a..12c533b 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -104,6 +104,8 @@ struct corsia_experts {
+ 
+     // The expert pool (CORSIA_POOL_MIB): experts in engine-owned memory instead of the page cache.
+     std::unique_ptr<corsia_pool> pool;
++    size_t pool_batch_max = 32;     // CORSIA_POOL_BATCH_MAX: more missing experts than this in one layer bypass the pool
++    int64_t pool_batch_tokens = 64; // CORSIA_POOL_BATCH_TOKENS: ...but only in batches of more tokens than this
+ 
+     // Residency-aware routing (CORSIA_SWAP).
+     bool swap_on = false;
+@@ -295,6 +297,10 @@ struct corsia_experts {
+         std::partial_sort(order.begin(), order.begin() + k, order.end(),
+             [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
+         guessed[t].assign(order.begin(), order.begin() + k);
++        if (pool) {
++            pool->guess(t, guessed[t]); // the loader fills what the pool lacks, straight into it
++            return;
++        }
+         ranges.clear();
+         for (const tensor & tn : layers[t]) {
+             for (int32_t e : guessed[t]) {
+@@ -536,8 +542,18 @@ struct corsia_experts {
+             }
+         }
+         if (pool) {
+-            pool->ensure(il, want); // read straight into the pool; the matmul is pointed there
+-            return;
++            // Read straight into the pool; the matmul is pointed there. A large prompt batch
++            // gets back the experts it misses and fetches them through the page cache below.
++            // Only prompt-sized batches bypass: a speculative verification batch (a few
++            // drafted tokens) loads into the pool like a single token does.
++            const std::vector<int32_t> rest = pool->ensure(il, want, true, n_tok > pool_batch_tokens ? pool_batch_max : SIZE_MAX);
++            if (rest.empty()) {
++                return;
++            }
++            want.assign(n_expert, 0);
++            for (int32_t e : rest) {
++                want[e] = 1;
++            }
+         }
+         if (broken || client == nullptr) {
+             return;
+@@ -681,6 +697,12 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+         if (const char * w = std::getenv("CORSIA_SWAP_DEPTH")) {
+             s->swap_depth = std::max(0, std::atoi(w));
+         }
++        if (const char * w = std::getenv("CORSIA_POOL_BATCH_MAX")) {
++            s->pool_batch_max = (size_t) std::max(0, std::atoi(w));
++        }
++        if (const char * w = std::getenv("CORSIA_POOL_BATCH_TOKENS")) {
++            s->pool_batch_tokens = std::max(0, std::atoi(w));
++        }
+         if (const char * w = std::getenv("CORSIA_SKIP")) {
+             s->skip_below = std::max(0.0f, (float) std::atof(w));
+         }
+@@ -717,7 +739,7 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+                 // already in the pool, guesses cost more drive time than the misses they hide
+                 // (measured: 1.46 tok/s with guessing against 1.93 without, same conditions).
+                 // Experts a guess or anything else left in the page cache are still copied in.
+-                s->predict_on = false;
++                s->predict_on = s->pool->bg != nullptr && s->predict_on; // only with the background loader
+                 if (std::getenv("CORSIA_SWAP") == nullptr) {
+                     s->swap_on = true; // with the pool on, swapping is the default (CORSIA_SWAP=0 turns it off)
+                 }
+diff --git a/common/corsia-pool.h b/common/corsia-pool.h
+index ff975c0..0f3c653 100644
+--- a/common/corsia-pool.h
++++ b/common/corsia-pool.h
+@@ -30,6 +30,10 @@
+ #include <sys/stat.h>
+ 
+ #include <algorithm>
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <thread>
+ #include <chrono>
+ #include <cstdlib>
+ #include <fstream>
+@@ -65,12 +69,45 @@ struct corsia_pool {
+     uint64_t copies = 0, copied_bytes = 0;
+     const uint8_t * map = nullptr; // the model file mapped read-only (shares the page cache)
+     size_t map_len = 0;
+-    std::vector<unsigned char> core;
++    // The background loader (CORSIA_POOL_GUESS=1): a second connection on the same arena
++    // fills guessed experts while the current layer computes. One lock guards the tables.
++    mutable std::mutex mu;
++    std::condition_variable cv;
++    std::vector<uint8_t> loading;     // [slot] a read is filling it
++    corsia_client * bg = nullptr;
++    std::thread loader;
++    bool stop = false;
++    struct job {
++        int il;
++        std::vector<int32_t> experts;
++    };
++    std::deque<job> jobs;
++    uint64_t waits = 0, stale = 0, bg_loads = 0, bg_bytes = 0;
++    uint64_t bypassed = 0; // experts of large batches fetched outside the pool
+ 
+     using set_fn = void (*)(const void * data, const void * const * ptrs);
+     set_fn set_ptrs = nullptr;
+ 
+     ~corsia_pool() {
++        if (loader.joinable()) {
++            {
++                std::lock_guard<std::mutex> lk(mu);
++                stop = true;
++            }
++            cv.notify_all();
++            loader.join();
++        }
++        if (bypassed) {
++            LOG_INF("corsia: expert pool: %llu experts of large prompt batches were fetched outside the pool instead of churning it\n",
++                (unsigned long long) bypassed);
++        }
++        if (bg_loads + waits) {
++            LOG_INF("corsia: expert pool loader: %llu guessed experts loaded in the background (%llu MiB), %llu times a layer waited for one, %llu stale guesses dropped\n",
++                (unsigned long long) bg_loads, (unsigned long long) (bg_bytes >> 20), (unsigned long long) waits, (unsigned long long) stale);
++        }
++        if (bg) {
++            corsia_close(bg);
++        }
+         save_profile();
+         if (hits + loads + copies) {
+             LOG_INF("corsia: expert pool: %lld slots of %.1f MiB, %llu of %llu chosen experts already there (%.0f%%), %llu MiB read into it, %llu experts (%llu MiB) copied in from guesses, %llu tensors pointed at it%s\n",
+@@ -127,6 +164,7 @@ struct corsia_pool {
+         owner.assign(n_slots, -1);
+         last_use.assign(n_slots, 0);
+         uses.assign(layers.size() * n_expert, 0.0);
++        loading.assign(n_slots, 0);
+         if (const char * pp = std::getenv("CORSIA_POOL_PROFILE"); pp && *pp) {
+             profile = pp;
+         } else if (const char * home = std::getenv("HOME")) {
+@@ -134,6 +172,15 @@ struct corsia_pool {
+             profile = std::string(home) + "/.cache/corsia/" + model_path.substr(slash == std::string::npos ? 0 : slash + 1) + ".pool-profile";
+         }
+         warm();
++        if (const char * g = std::getenv("CORSIA_POOL_GUESS"); g && std::strcmp(g, "0") != 0) {
++            char err2[256] = {0};
++            bg = corsia_connect_shared(socket, io, err2, sizeof(err2));
++            if (bg) {
++                loader = std::thread(&corsia_pool::run_loader, this);
++            } else {
++                LOG_WRN("corsia: no second connection for the pool loader (%s); loading on demand only\n", err2);
++            }
++        }
+         return true;
+     }
+ 
+@@ -236,46 +283,27 @@ struct corsia_pool {
+     }
+ 
+     bool has(int il, int32_t e) const {
+-        return (size_t) il < layers.size() && e >= 0 && e < n_expert && where[il * n_expert + e] >= 0;
++        if ((size_t) il >= layers.size() || e < 0 || e >= n_expert) {
++            return false;
++        }
++        std::lock_guard<std::mutex> lk(mu);
++        const int32_t s = where[il * n_expert + e];
++        return s >= 0 && !loading[s];
+     }
+ 
+-    // Makes sure every expert flagged in `want` is in the pool for layer `il`.
+-    void ensure(int il, const std::vector<uint8_t> & want, bool count = true) {
+-        if ((size_t) il >= layers.size() || layers[il].empty()) {
+-            return;
+-        }
+-        tick++;
+-        std::vector<int32_t> missing;
+-        for (int64_t e = 0; e < n_expert && e < (int64_t) want.size(); e++) {
+-            if (!want[e]) {
+-                continue;
+-            }
+-            if (count) {
+-                uses[il * n_expert + e] += 1.0;
+-            }
+-            const int32_t s = where[il * n_expert + e];
+-            if (s >= 0) {
+-                last_use[s] = tick;
+-                hits++;
+-            } else {
+-                missing.push_back((int32_t) e);
+-            }
+-        }
+-        if (missing.empty()) {
+-            return;
+-        }
+-        // Slots for the missing experts: free ones first, then the least recently used,
+-        // never one this layer is using right now (those were just touched).
++    // Picks n slots (lock held): free ones first, then the least recently used that this
++    // layer is not using and no read is filling.
++    std::vector<int32_t> pick_slots(size_t n) {
+         std::vector<int32_t> slots;
+-        for (int32_t s = 0; s < n_slots && slots.size() < missing.size(); s++) {
+-            if (owner[s] < 0) {
++        for (int32_t s = 0; s < n_slots && slots.size() < n; s++) {
++            if (owner[s] < 0 && !loading[s]) {
+                 slots.push_back(s);
+             }
+         }
+-        while (slots.size() < missing.size()) {
++        while (slots.size() < n) {
+             int32_t best = -1;
+             for (int32_t s = 0; s < n_slots; s++) {
+-                if (last_use[s] != tick && owner[s] >= 0 && (best < 0 || last_use[s] < last_use[best])) {
++                if (last_use[s] != tick && owner[s] >= 0 && !loading[s] && (best < 0 || last_use[s] < last_use[best])) {
+                     best = s;
+                 }
+             }
+@@ -283,27 +311,33 @@ struct corsia_pool {
+                 break;
+             }
+             evict(best);
+-            last_use[best] = tick; // reserved for this layer
+             slots.push_back(best);
+         }
+-        // Experts whose pages a guess already put in the page cache are copied into their
+-        // slot from the mapped file (memory speed); the rest are read from the drives.
++        return slots;
++    }
++
++    // Fills reserved slots with experts of layer il (lock not held): from the page cache
++    // when a guess already put the pages there, else read by Corsia through client c.
++    // got_ptrs[i][t] receives where tensor t's slice of expert i landed (null on failure).
++    void fill(corsia_client * c, int il, const std::vector<int32_t> & exps, const std::vector<int32_t> & slots,
++              std::vector<std::vector<const void *>> & got_ptrs, uint64_t & read_bytes, uint64_t & copy_bytes, uint64_t & copied) {
+         const size_t per = layers[il].size();
+-        std::vector<size_t> to_read; // indexes into missing/slots
+-        for (size_t i = 0; i < slots.size(); i++) {
+-            if (in_page_cache(il, missing[i])) {
++        got_ptrs.assign(exps.size(), std::vector<const void *>(per, nullptr));
++        std::vector<size_t> to_read;
++        std::vector<unsigned char> mc;
++        for (size_t i = 0; i < exps.size(); i++) {
++            if (in_page_cache(il, exps[i], mc)) {
+                 uint64_t at = (uint64_t) slots[i] * slot_bytes;
+                 for (size_t ti = 0; ti < per; ti++) {
+                     const slice & sl = layers[il][ti];
+-                    const uint64_t off = sl.offs + (uint64_t) missing[i] * sl.stride;
++                    const uint64_t off = sl.offs + (uint64_t) exps[i] * sl.stride;
+                     uint8_t * dst = base + at + off % 4096; // the same alignment a read would give
+                     std::memcpy(dst, map + off, sl.stride);
+-                    ptrs[il][ti][missing[i]] = dst;
+-                    copied_bytes += sl.stride;
++                    got_ptrs[i][ti] = dst;
++                    copy_bytes += sl.stride;
+                     at += room(sl.stride);
+                 }
+-                take(slots[i], il, missing[i]);
+-                copies++;
++                copied++;
+             } else {
+                 to_read.push_back(i);
+             }
+@@ -312,52 +346,178 @@ struct corsia_pool {
+             return;
+         }
+         std::vector<corsia_range> ranges;
+-        std::vector<size_t> tensor_of;
+         for (size_t i : to_read) {
+             uint64_t at = (uint64_t) slots[i] * slot_bytes;
+             for (size_t ti = 0; ti < per; ti++) {
+                 const slice & sl = layers[il][ti];
+-                ranges.push_back({ sl.offs + (uint64_t) missing[i] * sl.stride, (uint32_t) sl.stride, at });
+-                tensor_of.push_back(ti);
++                ranges.push_back({ sl.offs + (uint64_t) exps[i] * sl.stride, (uint32_t) sl.stride, at });
+                 at += room(sl.stride);
+             }
+         }
+         if (ranges.size() > CORSIA_MAX_RANGES) {
+-            failures++;
+             return;
+         }
+         std::vector<corsia_landed> got(ranges.size());
+-        if (corsia_read(io, ranges.data(), ranges.size(), got.data()) != 0) {
+-            failures++;
+-            return; // these experts stay at their usual place in the mapped file
++        if (corsia_read(c, ranges.data(), ranges.size(), got.data()) != 0) {
++            return;
+         }
+         for (size_t j = 0; j < to_read.size(); j++) {
+-            const size_t i = to_read[j];
+             bool ok = true;
+             for (size_t r = j * per; r < (j + 1) * per; r++) {
+                 ok = ok && got[r].got == ranges[r].len;
+             }
+             if (!ok) {
++                continue;
++            }
++            for (size_t ti = 0; ti < per; ti++) {
++                got_ptrs[to_read[j]][ti] = base + got[j * per + ti].data_off;
++                read_bytes += got[j * per + ti].got;
++            }
++        }
++    }
++
++    // Publishes filled slots (lock held): pointers for ggml, or the slot freed on failure.
++    // Returns how many experts landed.
++    size_t publish(int il, const std::vector<int32_t> & exps, const std::vector<int32_t> & slots,
++                   const std::vector<std::vector<const void *>> & got_ptrs) {
++        size_t ok_n = 0;
++        for (size_t i = 0; i < exps.size(); i++) {
++            const int32_t key = (int32_t) (il * n_expert + exps[i]);
++            const bool ok = std::all_of(got_ptrs[i].begin(), got_ptrs[i].end(), [](const void * p) { return p != nullptr; });
++            if (ok) {
++                for (size_t ti = 0; ti < got_ptrs[i].size(); ti++) {
++                    ptrs[il][ti][exps[i]] = got_ptrs[i][ti];
++                }
++                ok_n++;
++            } else {
++                owner[slots[i]] = -1;
++                where[key] = -1;
+                 failures++;
++            }
++            loading[slots[i]] = 0;
++        }
++        cv.notify_all();
++        return ok_n;
++    }
++
++    // Reserves slots for exps (lock held), marking them as being filled.
++    std::vector<int32_t> reserve(int il, std::vector<int32_t> & exps) {
++        std::vector<int32_t> slots = pick_slots(exps.size());
++        exps.resize(slots.size());
++        for (size_t i = 0; i < slots.size(); i++) {
++            owner[slots[i]] = (int32_t) (il * n_expert + exps[i]);
++            where[il * n_expert + exps[i]] = slots[i];
++            loading[slots[i]] = 1;
++            last_use[slots[i]] = tick;
++        }
++        return slots;
++    }
++
++    // Makes sure every expert flagged in `want` is in the pool for layer `il`. A layer that
++    // misses more than max_load experts (a large prompt batch touches nearly all of them,
++    // more than the pool holds) loads nothing: the missing experts are returned for the
++    // caller to fetch the way it does without the pool, and the pool keeps the experts
++    // generation needs instead of churning through the whole model.
++    std::vector<int32_t> ensure(int il, const std::vector<uint8_t> & want, bool count = true, size_t max_load = SIZE_MAX) {
++        if ((size_t) il >= layers.size() || layers[il].empty()) {
++            return {};
++        }
++        std::unique_lock<std::mutex> lk(mu);
++        tick++;
++        std::vector<int32_t> missing;
++        for (int64_t e = 0; e < n_expert && e < (int64_t) want.size(); e++) {
++            if (!want[e]) {
+                 continue;
+             }
+-            for (size_t r = j * per; r < (j + 1) * per; r++) {
+-                ptrs[il][tensor_of[r]][missing[i]] = base + got[r].data_off;
+-                loaded_bytes += got[r].got;
++            if (count) {
++                uses[il * n_expert + e] += 1.0;
++            }
++            const int32_t key = (int32_t) (il * n_expert + e);
++            if (where[key] >= 0 && loading[where[key]]) {
++                waits++; // the background loader is filling it: wait instead of reading it twice
++                cv.wait(lk, [&] { return where[key] < 0 || !loading[where[key]]; });
++            }
++            const int32_t s = where[key];
++            if (s >= 0) {
++                last_use[s] = tick;
++                hits++;
++            } else {
++                missing.push_back((int32_t) e);
+             }
+-            take(slots[i], il, missing[i]);
+-            loads++;
+         }
++        if (missing.empty()) {
++            return {};
++        }
++        if (missing.size() > max_load) {
++            bypassed += missing.size();
++            return missing;
++        }
++        std::vector<int32_t> slots = reserve(il, missing);
++        if (slots.empty()) {
++            return missing;
++        }
++        lk.unlock();
++        std::vector<std::vector<const void *>> got_ptrs;
++        uint64_t rb = 0, cb = 0, cn = 0;
++        fill(io, il, missing, slots, got_ptrs, rb, cb, cn);
++        lk.lock();
++        const size_t ok_n = publish(il, missing, slots, got_ptrs);
++        loads += ok_n - std::min<uint64_t>(ok_n, cn);
++        copies += cn;
++        loaded_bytes += rb;
++        copied_bytes += cb;
++        return {};
+     }
+ 
+-    void take(int32_t slot, int il, int32_t e) {
+-        owner[slot] = (int32_t) (il * n_expert + e);
+-        where[il * n_expert + e] = slot;
+-        last_use[slot] = tick;
++    // A guess for layer il: the background loader fills the experts the pool lacks.
++    void guess(int il, const std::vector<int32_t> & experts) {
++        if (bg == nullptr || (size_t) il >= layers.size()) {
++            return;
++        }
++        std::lock_guard<std::mutex> lk(mu);
++        jobs.push_back({ il, experts });
++        while (jobs.size() > 2) {
++            jobs.pop_front();
++            stale++;
++        }
++        cv.notify_all();
++    }
++
++    void run_loader() {
++        std::unique_lock<std::mutex> lk(mu);
++        while (true) {
++            cv.wait(lk, [&] { return stop || !jobs.empty(); });
++            if (stop) {
++                return;
++            }
++            job j = std::move(jobs.back()); // only the newest guess is still useful
++            stale += jobs.size() - 1;
++            jobs.clear();
++            std::vector<int32_t> need;
++            for (int32_t e : j.experts) {
++                if (e >= 0 && e < n_expert && where[j.il * n_expert + e] < 0) {
++                    need.push_back(e);
++                }
++            }
++            if (need.empty()) {
++                continue;
++            }
++            std::vector<int32_t> slots = reserve(j.il, need);
++            if (slots.empty()) {
++                continue;
++            }
++            lk.unlock();
++            std::vector<std::vector<const void *>> got_ptrs;
++            uint64_t rb = 0, cb = 0, cn = 0;
++            fill(bg, j.il, need, slots, got_ptrs, rb, cb, cn);
++            lk.lock();
++            bg_loads += publish(j.il, need, slots, got_ptrs);
++            bg_bytes += rb + cb;
++        }
+     }
+ 
+     // True when every slice of the expert is in the page cache of the mapped model file.
+-    bool in_page_cache(int il, int32_t e) {
++    bool in_page_cache(int il, int32_t e, std::vector<unsigned char> & mc) const {
+         if (map == nullptr) {
+             return false;
+         }
+@@ -365,12 +525,12 @@ struct corsia_pool {
+             const uint64_t a = (sl.offs + (uint64_t) e * sl.stride) / 4096 * 4096;
+             const uint64_t b = std::min<uint64_t>(sl.offs + (uint64_t) (e + 1) * sl.stride, map_len);
+             const size_t n = (b - a + 4095) / 4096;
+-            core.resize(n);
+-            if (b <= a || mincore((void *) (map + a), b - a, core.data()) != 0) {
++            mc.resize(n);
++            if (b <= a || mincore((void *) (map + a), b - a, mc.data()) != 0) {
+                 return false;
+             }
+             for (size_t i = 0; i < n; i++) {
+-                if (!(core[i] & 1)) {
++                if (!(mc[i] & 1)) {
+                     return false;
+                 }
+             }
+diff --git a/src/corsia-client.h b/src/corsia-client.h
+index a6f5a31..047984c 100644
+--- a/src/corsia-client.h
++++ b/src/corsia-client.h
+@@ -70,6 +70,7 @@ typedef struct corsia_client {
+     uint64_t model_bytes;
+     uint64_t batch;
+     uint8_t *msg;
++    int arena_fd; /* kept so a second connection can share the arena */
+ } corsia_client;
+ 
+ static inline void corsia__put16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
+@@ -129,22 +130,23 @@ static inline void corsia__err(char *err, size_t errlen, const char *what) {
+     if (err && errlen) snprintf(err, errlen, "%s: %s", what, strerror(errno));
+ }
+ 
+-/* Connects and shares an arena of arena_bytes. NULL on failure, with a reason in err. */
+-static inline corsia_client *corsia_connect(const char *socket_path, size_t arena_bytes, char *err, size_t errlen) {
++/* Connects using mfd (an arena of arena_bytes the client then owns). */
++static inline corsia_client *corsia__connect_fd(const char *socket_path, int mfd, size_t arena_bytes, char *err, size_t errlen) {
+     struct sockaddr_un addr;
+     corsia_client *c;
+     uint8_t hello[CORSIA_HEAD + 8];
+-    int mfd;
+     ssize_t n;
+ 
+     if (strlen(socket_path) >= sizeof addr.sun_path) {
+         errno = ENAMETOOLONG;
+         corsia__err(err, errlen, "socket path");
++        close(mfd);
+         return NULL;
+     }
+     c = (corsia_client *)calloc(1, sizeof *c);
+-    if (!c) return NULL;
++    if (!c) { close(mfd); return NULL; }
+     c->fd = -1;
++    c->arena_fd = mfd;
+     c->arena = (uint8_t *)MAP_FAILED;
+     c->msg = (uint8_t *)malloc(CORSIA_MAX_MSG);
+     if (!c->msg) goto fail;
+@@ -155,17 +157,13 @@ static inline corsia_client *corsia_connect(const char *socket_path, size_t aren
+     memcpy(addr.sun_path, socket_path, strlen(socket_path));
+     if (connect(c->fd, (struct sockaddr *)&addr, sizeof addr) != 0) { corsia__err(err, errlen, "connect"); goto fail; }
+ 
+-    mfd = (int)syscall(SYS_memfd_create, "corsia-arena", MFD_CLOEXEC);
+-    if (mfd < 0) { corsia__err(err, errlen, "memfd_create"); goto fail; }
+-    if (ftruncate(mfd, (off_t)arena_bytes) != 0) { corsia__err(err, errlen, "ftruncate"); close(mfd); goto fail; }
+     c->arena = (uint8_t *)mmap(NULL, arena_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+-    if (c->arena == (uint8_t *)MAP_FAILED) { corsia__err(err, errlen, "mmap"); close(mfd); goto fail; }
++    if (c->arena == (uint8_t *)MAP_FAILED) { corsia__err(err, errlen, "mmap"); goto fail; }
+     c->arena_bytes = arena_bytes;
+ 
+     corsia__header(hello, 0x00);
+     corsia__put64(hello + CORSIA_HEAD, (uint64_t)arena_bytes);
+-    if (corsia__send(c->fd, hello, sizeof hello, mfd) != 0) { corsia__err(err, errlen, "send HELLO"); close(mfd); goto fail; }
+-    close(mfd);
++    if (corsia__send(c->fd, hello, sizeof hello, mfd) != 0) { corsia__err(err, errlen, "send HELLO"); goto fail; }
+     n = corsia__recv(c->fd, c->msg, CORSIA_MAX_MSG);
+     if (corsia__type(c->msg, n) != 0x80 || n < (ssize_t)(CORSIA_HEAD + 8)) {
+         if (err && errlen) {
+@@ -182,11 +180,28 @@ static inline corsia_client *corsia_connect(const char *socket_path, size_t aren
+ fail:
+     if (c->arena != (uint8_t *)MAP_FAILED) munmap(c->arena, arena_bytes);
+     if (c->fd >= 0) close(c->fd);
++    if (c->arena_fd >= 0) close(c->arena_fd);
+     free(c->msg);
+     free(c);
+     return NULL;
+ }
+ 
++/* Connects and shares an arena of arena_bytes. NULL on failure, with a reason in err. */
++static inline corsia_client *corsia_connect(const char *socket_path, size_t arena_bytes, char *err, size_t errlen) {
++    int mfd = (int)syscall(SYS_memfd_create, "corsia-arena", MFD_CLOEXEC);
++    if (mfd < 0) { corsia__err(err, errlen, "memfd_create"); return NULL; }
++    if (ftruncate(mfd, (off_t)arena_bytes) != 0) { corsia__err(err, errlen, "ftruncate"); close(mfd); return NULL; }
++    return corsia__connect_fd(socket_path, mfd, arena_bytes, err, errlen);
++}
++
++/* A second connection on the same arena as first (the same memory, mapped again), for
++ * reads from another thread: data_off in its results are offsets into that same arena. */
++static inline corsia_client *corsia_connect_shared(const char *socket_path, const corsia_client *first, char *err, size_t errlen) {
++    int mfd = dup(first->arena_fd);
++    if (mfd < 0) { corsia__err(err, errlen, "dup"); return NULL; }
++    return corsia__connect_fd(socket_path, mfd, first->arena_bytes, err, errlen);
++}
++
+ static inline uint64_t corsia_model_bytes(const corsia_client *c) { return c->model_bytes; }
+ static inline uint8_t *corsia_arena(const corsia_client *c) { return c->arena; }
+ static inline size_t corsia_arena_bytes(const corsia_client *c) { return c->arena_bytes; }
+@@ -275,6 +290,7 @@ static inline void corsia_close(corsia_client *c) {
+     if (!c) return;
+     if (c->arena != (uint8_t *)MAP_FAILED) munmap(c->arena, c->arena_bytes);
+     if (c->fd >= 0) close(c->fd);
++    if (c->arena_fd >= 0) close(c->arena_fd);
+     free(c->msg);
+     free(c);
+ }
+-- 
+2.53.0
+

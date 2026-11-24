@@ -1,0 +1,111 @@
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index fd3f5a6..91d6dff 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -20,6 +20,9 @@
+ // drives work during compute instead of after it. CORSIA_PREDICT=0 turns this off;
+ // CORSIA_PREDICT_EXTRA (default 0) adds that many guesses beyond the model's top-k.
+ // The run ends with the share of experts that were guessed right.
++//
++// CORSIA_TRACE=path records which experts every generated token used in every layer, in
++// Corsia's trace format (`corsia replay` reads it). It works without CORSIA_SOCKET too.
+ 
+ #include "../src/corsia-client.h"
+ #include "ggml.h"
+@@ -80,7 +83,16 @@ struct corsia_experts {
+     std::vector<float> x, h, logits;
+     std::vector<int32_t> order;
+ 
++    // Routing trace (CORSIA_TRACE): one line per generated token, one group per layer.
++    FILE * trace = nullptr;
++    std::vector<std::vector<int32_t>> trace_tok;
++    uint64_t traced = 0;
++
+     ~corsia_experts() {
++        if (trace) {
++            std::fclose(trace);
++            LOG_INF("corsia: recorded the routing of %llu generated tokens\n", (unsigned long long) traced);
++        }
+         if (client) {
+             corsia_close(client);
+         }
+@@ -249,8 +261,28 @@ struct corsia_experts {
+     }
+ 
+     // The router output for layer `il`: I32 [n_expert_used, n_tokens], possibly a view.
++    void record(int il, const std::vector<int32_t> & used) {
++        if (trace_tok.size() != layers.size()) {
++            trace_tok.assign(layers.size(), {});
++        }
++        trace_tok[il] = used;
++        if (il + 1 != (int) layers.size()) {
++            return;
++        }
++        for (size_t l = 0; l < trace_tok.size(); l++) {
++            if (l) std::fputc(' ', trace);
++            for (size_t i = 0; i < trace_tok[l].size(); i++) {
++                std::fprintf(trace, i ? ",%d" : "%d", trace_tok[l][i]);
++            }
++            trace_tok[l].clear();
++        }
++        std::fputc('\n', trace);
++        std::fflush(trace);
++        traced++;
++    }
++
+     void prefetch(const ggml_tensor * topk, int il) {
+-        if (broken || il < 0 || (size_t) il >= layers.size() || layers[il].empty() || topk->type != GGML_TYPE_I32) {
++        if (il < 0 || (size_t) il >= layers.size() || layers[il].empty() || topk->type != GGML_TYPE_I32) {
+             return;
+         }
+         const int64_t k_used = topk->ne[0];
+@@ -274,6 +306,12 @@ struct corsia_experts {
+                 guessed[il].clear();
+             }
+         }
++        if (trace && n_tok == 1) {
++            record(il, ids);
++        }
++        if (broken || client == nullptr) {
++            return;
++        }
+         ranges.clear();
+         for (const tensor & t : layers[il]) {
+             for (int64_t e = 0; e < t.n_expert && e < n_expert; e++) {
+@@ -318,7 +356,10 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+     static std::unique_ptr<corsia_experts> instance;
+     static bool tried = false;
+     const char * socket = std::getenv("CORSIA_SOCKET");
+-    if (socket == nullptr || *socket == '\0' || cparams.cb_eval != nullptr) {
++    const char * trace_path = std::getenv("CORSIA_TRACE");
++    const bool want_socket = socket != nullptr && *socket != '\0';
++    const bool want_trace = trace_path != nullptr && *trace_path != '\0';
++    if ((!want_socket && !want_trace) || cparams.cb_eval != nullptr) {
+         return;
+     }
+     if (!tried) {
+@@ -330,6 +371,24 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+             LOG_WRN("corsia: %s has no expert tensors to stream; not prefetching\n", model_path.c_str());
+             return;
+         }
++        if (want_trace) {
++            s->trace = std::fopen(trace_path, "w");
++            if (s->trace == nullptr) {
++                LOG_WRN("corsia: cannot write the trace to %s (%s)\n", trace_path, std::strerror(errno));
++            } else {
++                const char * base = std::strrchr(model_path.c_str(), '/');
++                std::fprintf(s->trace, "# corsia-trace 1\n# layers=%zu experts=%lld topk=%d source=llama.cpp model=%s\n",
++                    s->layers.size(), (long long) s->layers[0][0].n_expert, s->n_used, base ? base + 1 : model_path.c_str());
++            }
++        }
++        if (!want_socket) {
++            s->predict_on = false;
++            LOG_INF("corsia: recording routing to %s (no Corsia socket: not prefetching)\n", trace_path);
++            instance = std::move(s);
++            cparams.cb_eval = corsia_experts::eval_cb;
++            cparams.cb_eval_user_data = instance.get();
++            return;
++        }
+         if (statfs(model_path.c_str(), &fs) == 0 && fs.f_type != 0x65735546 /* FUSE */) {
+             LOG_WRN("corsia: %s is not on Corsia's mount; prefetching only helps a model opened from the mount\n", model_path.c_str());
+         }

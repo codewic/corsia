@@ -1,0 +1,266 @@
+From 29083a0106fce7f3c39993e79b5eb22ba8615944 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:43:35 +0000
+Subject: [PATCH] corsia: project-wide n-gram drafts
+
+---
+ CORSIA.md              |   2 +
+ common/corsia-corpus.h | 182 +++++++++++++++++++++++++++++++++++++++++
+ common/speculative.cpp |  24 +++++-
+ 3 files changed, 206 insertions(+), 2 deletions(-)
+ create mode 100644 common/corsia-corpus.h
+
+diff --git a/CORSIA.md b/CORSIA.md
+index c4d04ad..026f14b 100644
+--- a/CORSIA.md
++++ b/CORSIA.md
+@@ -20,6 +20,7 @@ upstream llama.cpp.
+ | Complete trace lines | `common/corsia-experts.h` | A trace line is written only when every layer recorded its experts |
+ | Expert pointer table | `ggml/src/ggml-cpu/ggml-cpu.c`, `tiled/tiled.cpp`, `ggml-cpu.cpp` | The expert matmul can take each expert's weights from a pointer table (`ggml_backend_cpu_set_expert_ptrs`), so experts can live outside their tensor |
+ | Expert pool | `common/corsia-pool.h` | Experts live in memory the engine owns, read by Corsia straight from its drives (no page cache, no faults, no reclaim), least recently used evicted, warm-started from a per-model usage profile |
++| Project-wide drafts | `common/corsia-corpus.h`, `common/speculative.cpp` | When `ngram-simple` finds nothing in the context, the same n-gram is looked up in the project's tokens (written by `corsia agent`), with a confidence gate that learns from accepted drafts |
+ | Pool sized from memory | `common/corsia-experts.h` | On by default: the pool takes what the memory cap (or the free memory) leaves after the other weights, the KV cache and the program |
+ | Residency-aware routing | `common/corsia-experts.h` | A chosen expert that is not in memory is swapped for a close runner-up that is, before the weights are gathered |
+ | Confidence-based skipping | `common/corsia-experts.h` | Experts under a share of the layer's weight are skipped (off: it moved the output too much at useful thresholds) |
+@@ -37,6 +38,7 @@ upstream llama.cpp.
+ | `CORSIA_POOL_MIB` | `auto` | Size of the expert pool in MiB, `auto` to size it from memory, `0` for no pool. `auto` uses the cgroup's memory cap, or the memory free at start less a tenth of the machine (at least 1 GiB) for everything else, then leaves room for the weights that are not experts, the KV cache and 1.1 GiB for the program. The pool turns guessing ahead off and swapping on |
+ | `CORSIA_POOL_PROFILE` | `~/.cache/corsia/<model>.pool-profile` | Where the pool keeps its usage profile |
+ | `CORSIA_SWAP` | on with the pool, else off | Residency-aware routing; `0` turns it off. `CORSIA_SWAP_RATIO` (0.5), `CORSIA_SWAP_MAX` (2), `CORSIA_SWAP_DEPTH` (8) tune it |
++| `CORSIA_DRAFT_CORPUS` | unset | The project token file `corsia agent` writes (`--corpus`); used by `--spec-type ngram-simple` |
+ | `CORSIA_SKIP` | off | Skip experts under this share of the layer's weight; `CORSIA_SKIP_MIN` (4) are always kept |
+ 
+ Your own `OMP_WAIT_POLICY` or `GOMP_SPINCOUNT` always wins over cool waiting.
+diff --git a/common/corsia-corpus.h b/common/corsia-corpus.h
+new file mode 100644
+index 0000000..9c4eccd
+--- /dev/null
++++ b/common/corsia-corpus.h
+@@ -0,0 +1,182 @@
++#pragma once
++
++// Project-wide drafts: free n-gram drafts from the whole project, not only the context.
++//
++// ngram-simple drafts by finding the last few tokens earlier in the context and proposing what
++// followed them there. A coding assistant also writes a lot that exists elsewhere in the project
++// but not in its context (signatures, imports, patterns from other files): in the history of two
++// real projects, the project's files gave 42 to 67% more free drafts than the context alone.
++//
++// CORSIA_DRAFT_CORPUS names a file of the project's tokens (little-endian int32, -1 between
++// files), written by `corsia agent` for the project the assistant works in. When the context
++// has no match, the same n-gram is looked up here. The file is read again when it changes.
++//
++// A short n-gram in a large project often starts a common phrase with many continuations, and a
++// wrong draft costs a verify pass (on a CPU with streamed experts, a lot). So a project draft
++// needs confidence: of up to 8 earlier occurrences, the one whose match runs furthest back is
++// used, only if it runs back at least `min_match` tokens, and the draft is no longer than the
++// match. `min_match` follows the results: it grows while project drafts are rejected and
++// shrinks while they are accepted. (Measured first without this on a dev box: 31% of project
++// drafts accepted, slower than context-only drafts.)
++
++#include "common.h" // llama_tokens
++
++#include <sys/stat.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++struct corsia_corpus {
++    std::string path;
++    std::vector<llama_token> toks;
++    std::unordered_map<uint64_t, uint32_t> at; // hash of an n-gram -> position after its last occurrence
++    std::vector<uint32_t> prev;                // position after the previous occurrence of the same hash (0 = none)
++    size_t min_match = 0;                      // tokens of agreement a draft needs (adapts, see accepted())
++    double hit_rate = 0.5;                     // running share of project-drafted tokens accepted
++    size_t n = 0;                              // n-gram size the table was built for
++    int64_t mtime_ns = -1;
++    off_t size = -1;
++    uint32_t calls = 0;
++    uint64_t drafts = 0, drafted_tokens = 0;
++    std::mutex mu;
++
++    static corsia_corpus * get() {
++        static corsia_corpus * c = [] {
++            const char * p = std::getenv("CORSIA_DRAFT_CORPUS");
++            if (p == nullptr || *p == '\0') {
++                return (corsia_corpus *) nullptr;
++            }
++            auto * c = new corsia_corpus();
++            c->path = p;
++            return c;
++        }();
++        return c;
++    }
++
++    static uint64_t hash(const llama_token * t, size_t n) {
++        uint64_t h = 1469598103934665603ull;
++        for (size_t i = 0; i < n; i++) {
++            h = (h ^ (uint32_t) t[i]) * 1099511628211ull;
++        }
++        return h;
++    }
++
++    // Reads the file again if it changed (checked every 32 calls) or the n-gram size differs.
++    void refresh(size_t want_n) {
++        if (++calls % 32 != 1 && want_n == n) {
++            return;
++        }
++        struct stat st = {};
++        if (stat(path.c_str(), &st) != 0) {
++            if (!toks.empty()) {
++                toks.clear();
++                at.clear();
++            }
++            return;
++        }
++        const int64_t m = (int64_t) st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
++        if (m == mtime_ns && st.st_size == size && want_n == n) {
++            return;
++        }
++        FILE * f = std::fopen(path.c_str(), "rb");
++        if (f == nullptr) {
++            return;
++        }
++        std::vector<llama_token> t((size_t) st.st_size / sizeof(llama_token));
++        const size_t got = std::fread(t.data(), sizeof(llama_token), t.size(), f);
++        std::fclose(f);
++        t.resize(got);
++        toks.swap(t);
++        at.clear();
++        at.reserve(toks.size());
++        prev.assign(toks.size() + 1, 0);
++        n = want_n;
++        min_match = 2 * n;
++        for (size_t i = 0; i + n < toks.size(); i++) {
++            bool sep = false;
++            for (size_t k = 0; k < n; k++) {
++                if (toks[i + k] < 0) {
++                    sep = true;
++                    break;
++                }
++            }
++            if (!sep) {
++                uint32_t & slot = at[hash(&toks[i], n)];
++                prev[i + n] = slot;
++                slot = (uint32_t) (i + n);
++            }
++        }
++        mtime_ns = m;
++        size = st.st_size;
++        std::fprintf(stderr, "corsia: project drafts from %s: %zu tokens, %zu n-grams of %zu\n",
++            path.c_str(), toks.size(), at.size(), n);
++    }
++
++    // Draft up to m tokens after the last n tokens (the history's tail plus the sampled token).
++    llama_tokens draft(const llama_tokens & history, llama_token sampled, size_t n_gram, size_t m) {
++        llama_tokens out;
++        if (n_gram < 2 || history.size() + 1 < n_gram) {
++            return out;
++        }
++        std::lock_guard<std::mutex> lock(mu);
++        refresh(n_gram);
++        if (at.empty()) {
++            return out;
++        }
++        std::vector<llama_token> pat(history.end() - (n_gram - 1), history.end());
++        pat.push_back(sampled);
++        const auto it = at.find(hash(pat.data(), n_gram));
++        if (it == at.end()) {
++            return out;
++        }
++        // of up to 8 occurrences, the one that agrees furthest back with the history
++        const size_t look = std::min<size_t>(256, history.size() + 1);
++        size_t best_p = 0, best_len = 0;
++        uint32_t p = it->second;
++        for (int cand = 0; cand < 8 && p != 0; cand++, p = prev[p]) {
++            size_t len = 0;
++            while (len < look && len < p) {
++                const llama_token h = len == 0 ? sampled : history[history.size() - len];
++                if (toks[p - 1 - len] != h) {
++                    break;
++                }
++                len++;
++            }
++            if (len > best_len) {
++                best_len = len;
++                best_p = p;
++            }
++        }
++        if (best_len < std::max(n_gram, min_match)) {
++            return out;
++        }
++        const size_t want = std::min(m, best_len);
++        for (size_t q = best_p; q < toks.size() && out.size() < want && toks[q] >= 0; q++) {
++            out.push_back(toks[q]);
++        }
++        if (!out.empty()) {
++            drafts++;
++            drafted_tokens += out.size();
++        }
++        return out;
++    }
++
++    // Results of a project draft: how many of its tokens the model accepted.
++    void accepted(size_t n_drafted, size_t n_accepted) {
++        if (n_drafted == 0) {
++            return;
++        }
++        std::lock_guard<std::mutex> lock(mu);
++        hit_rate = 0.8 * hit_rate + 0.2 * ((double) n_accepted / (double) n_drafted);
++        if (hit_rate < 0.4) {
++            min_match = std::min<size_t>(min_match + 4, 8 * n);
++        } else if (hit_rate > 0.7 && min_match > n) {
++            min_match -= 2;
++        }
++    }
++};
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4006363..2ad6391 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1,3 +1,4 @@
++#include "corsia-corpus.h"
+ #include "speculative.h"
+ 
+ #include "common.h"
+@@ -2095,12 +2096,31 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+             }
+ 
+             *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
++            if ((size_t) seq_id >= corpus_drafted.size()) {
++                corpus_drafted.resize(seq_id + 1, 0);
++            }
++            corpus_drafted[seq_id] = 0;
++            if (dp.result->empty()) {
++                // nothing in the context: try the project (CORSIA_DRAFT_CORPUS, see corsia-corpus.h)
++                if (corsia_corpus * corpus = corsia_corpus::get()) {
++                    *dp.result = corpus->draft(*dp.prompt, dp.id_last, config.size_ngram, config.size_mgram);
++                    corpus_drafted[seq_id] = dp.result->size();
++                }
++            }
+         }
+     }
+ 
+-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+-        // noop
++    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
++        // project drafts learn from their results (see corsia-corpus.h)
++        if (seq_id >= 0 && (size_t) seq_id < corpus_drafted.size() && corpus_drafted[seq_id] > 0) {
++            if (corsia_corpus * corpus = corsia_corpus::get()) {
++                corpus->accepted(corpus_drafted[seq_id], n_accepted);
++            }
++            corpus_drafted[seq_id] = 0;
++        }
+     }
++
++    std::vector<size_t> corpus_drafted; // per sequence: size of the last project draft
+ };
+ 
+ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
+-- 
+2.53.0
+

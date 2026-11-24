@@ -1,0 +1,86 @@
+=== waiting for '=== done' in ~/.cache/corsia-build/phase2.log since 09:22:24 ===
+=== machine free at 11:22:25, running 2 round(s) ===
+Still 92 C after 15 minutes; starting anyway.
+=== original-1 ===
+Results go to ~/.cache/corsia-build/stream-20261123-113726.log
+this checkout already has the Corsia changes (fork branch or patched earlier)
+== Cap 6 GiB, model 11 GiB, 32 tokens
+== llama.cpp: -c 2048 -fa on -ctk q8_0 -ctv q8_0 -b 256 -ub 256
+== stream
+0.00.232.195 I corsia: streaming experts for 48 layers through /run/user/1000/corsia/Qwen3-30B-A3B-UD-Q2_K_XL.gguf.sock; guessing ahead off (48 routers, top 8 + 0)
+0.00.232.219 I corsia: 2 compute threads; a waiting thread spins 10000 times before it sleeps
+3.56.662.261 I common_perf_print:        load time =   64159.30 ms
+3.56.662.264 I common_perf_print: prompt eval time =   64158.88 ms /    10 tokens ( 6415.89 ms per token,     0.16 tokens per second)
+3.56.662.266 I common_perf_print:        eval time =   64069.61 ms /    31 runs   ( 2066.76 ms per token,     0.48 tokens per second)
+3.56.937.457 I corsia: 1536 expert prefetches, 3672 MiB put in memory ahead of use
+heat: 66.1 CPU seconds in 240.5 s (35.6 user, 30.5 system)
+heat: package peak 96 C, mean 92 C
+Done. Compare the 'eval time ... tokens per second' lines above (full output in ~/.cache/corsia-build/stream-20261123-113726.log).
+original-1: original (file) on sdb: 16.43 GiB in 23952 reads, 0 errors
+Still 90 C after 15 minutes; starting anyway.
+=== experts-1 ===
+Results go to ~/.cache/corsia-build/stream-20261123-115629.log
+this checkout already has the Corsia changes (fork branch or patched earlier)
+== Cap 6 GiB, model 11 GiB, 32 tokens
+== llama.cpp: -c 2048 -fa on -ctk q8_0 -ctv q8_0 -b 256 -ub 256
+== stream
+0.00.206.136 I corsia: streaming experts for 48 layers through /run/user/1000/corsia/Qwen3-30B-A3B-UD-Q2_K_XL.gguf.sock; guessing ahead off (48 routers, top 8 + 0)
+0.00.206.161 I corsia: 2 compute threads; a waiting thread spins 10000 times before it sleeps
+3.38.775.424 I common_perf_print:        load time =   62574.39 ms
+3.38.775.427 I common_perf_print: prompt eval time =   62573.98 ms /    10 tokens ( 6257.40 ms per token,     0.16 tokens per second)
+3.38.775.429 I common_perf_print:        eval time =   47955.88 ms /    31 runs   ( 1546.96 ms per token,     0.65 tokens per second)
+3.38.979.173 I corsia: 1536 expert prefetches, 3758 MiB put in memory ahead of use
+heat: 71.7 CPU seconds in 227.6 s (39.2 user, 32.5 system)
+heat: package peak 96 C, mean 92 C
+Done. Compare the 'eval time ... tokens per second' lines above (full output in ~/.cache/corsia-build/stream-20261123-115629.log).
+experts-1: original (file) on sdb: 11.41 GiB in 11681 reads, 0 errors
+experts-1: copy (experts) on sdb: 5.36 GiB in 5005 reads, 0 errors
+Still 89 C after 15 minutes; starting anyway.
+=== experts-2 ===
+Results go to ~/.cache/corsia-build/stream-20261123-121518.log
+this checkout already has the Corsia changes (fork branch or patched earlier)
+== Cap 6 GiB, model 11 GiB, 32 tokens
+== llama.cpp: -c 2048 -fa on -ctk q8_0 -ctv q8_0 -b 256 -ub 256
+== stream
+0.00.204.084 I corsia: streaming experts for 48 layers through /run/user/1000/corsia/Qwen3-30B-A3B-UD-Q2_K_XL.gguf.sock; guessing ahead off (48 routers, top 8 + 0)
+0.00.204.107 I corsia: 2 compute threads; a waiting thread spins 10000 times before it sleeps
+3.47.049.689 I common_perf_print:        load time =   62136.17 ms
+3.47.049.693 I common_perf_print: prompt eval time =   62135.72 ms /    10 tokens ( 6213.57 ms per token,     0.16 tokens per second)
+3.47.049.713 I common_perf_print:        eval time =   56672.44 ms /    31 runs   ( 1828.14 ms per token,     0.55 tokens per second)
+3.47.251.255 I corsia: 1536 expert prefetches, 3876 MiB put in memory ahead of use
+heat: 71.6 CPU seconds in 235.3 s (39.5 user, 32.1 system)
+heat: package peak 96 C, mean 92 C
+Done. Compare the 'eval time ... tokens per second' lines above (full output in ~/.cache/corsia-build/stream-20261123-121518.log).
+experts-2: original (file) on sdb: 11.23 GiB in 11497 reads, 0 errors
+experts-2: copy (experts) on sdb: 5.52 GiB in 6233 reads, 0 errors
+Still 92 C after 15 minutes; starting anyway.
+=== original-2 ===
+Results go to ~/.cache/corsia-build/stream-20261123-123415.log
+this checkout already has the Corsia changes (fork branch or patched earlier)
+== Cap 6 GiB, model 11 GiB, 32 tokens
+== llama.cpp: -c 2048 -fa on -ctk q8_0 -ctv q8_0 -b 256 -ub 256
+== stream
+0.00.243.298 I corsia: streaming experts for 48 layers through /run/user/1000/corsia/Qwen3-30B-A3B-UD-Q2_K_XL.gguf.sock; guessing ahead off (48 routers, top 8 + 0)
+0.00.243.319 I corsia: 2 compute threads; a waiting thread spins 10000 times before it sleeps
+4.05.253.599 I common_perf_print:        load time =   71483.61 ms
+4.05.253.602 I common_perf_print: prompt eval time =   71483.22 ms /    10 tokens ( 7148.32 ms per token,     0.14 tokens per second)
+4.05.253.605 I common_perf_print:        eval time =   66411.08 ms /    31 runs   ( 2142.29 ms per token,     0.47 tokens per second)
+4.05.466.144 I corsia: 1536 expert prefetches, 3722 MiB put in memory ahead of use
+heat: 94.0 CPU seconds in 250.4 s (45.6 user, 48.4 system)
+heat: package peak 95 C, mean 76 C
+Done. Compare the 'eval time ... tokens per second' lines above (full output in ~/.cache/corsia-build/stream-20261123-123415.log).
+original-2: original (file) on sdb: 16.94 GiB in 23557 reads, 0 errors
+=== Summary (prompt, then generation) ===
+experts-1:
+  prompt eval time =   62573.98 ms /    10 tokens ( 6257.40 ms per token,     0.16 tokens per second)
+  eval time =   47955.88 ms /    31 runs   ( 1546.96 ms per token,     0.65 tokens per second)
+experts-2:
+  prompt eval time =   62135.72 ms /    10 tokens ( 6213.57 ms per token,     0.16 tokens per second)
+  eval time =   56672.44 ms /    31 runs   ( 1828.14 ms per token,     0.55 tokens per second)
+original-1:
+  prompt eval time =   64158.88 ms /    10 tokens ( 6415.89 ms per token,     0.16 tokens per second)
+  eval time =   64069.61 ms /    31 runs   ( 2066.76 ms per token,     0.48 tokens per second)
+original-2:
+  prompt eval time =   71483.22 ms /    10 tokens ( 7148.32 ms per token,     0.14 tokens per second)
+  eval time =   66411.08 ms /    31 runs   ( 2142.29 ms per token,     0.47 tokens per second)
+=== exit 0 at 12:38:26 ===

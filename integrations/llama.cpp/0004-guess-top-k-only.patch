@@ -1,0 +1,22 @@
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index c5b0b7d..fd3f5a6 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -18,7 +18,7 @@
+ // through layer L+1's own norm and router (a small matrix-vector product) to guess which
+ // experts L+1 will pick. Those are prefetched in the background while L computes, so the
+ // drives work during compute instead of after it. CORSIA_PREDICT=0 turns this off;
+-// CORSIA_PREDICT_EXTRA (default 4) adds that many guesses beyond the model's top-k.
++// CORSIA_PREDICT_EXTRA (default 0) adds that many guesses beyond the model's top-k.
+ // The run ends with the share of experts that were guessed right.
+ 
+ #include "../src/corsia-client.h"
+@@ -73,7 +73,7 @@ struct corsia_experts {
+     size_t map_len = 0;
+     float eps = 1e-6f;
+     int n_used = 0;
+-    int extra = 4;
++    int extra = 0; // guesses beyond the model's top-k; 97 to 98% hit rate made spares cost more than they saved
+     bool predict_on = true;
+     std::vector<std::vector<int32_t>> guessed; // per layer, guessed from the layer before
+     uint64_t guess_hits = 0, guess_total = 0, guesses_sent = 0;

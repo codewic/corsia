@@ -1,0 +1,358 @@
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index 15c41dd..c5b0b7d 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -13,6 +13,13 @@
+ //   CORSIA_SOCKET=/run/user/1000/corsia/model.gguf.sock llama-completion -m ~/corsia/model.gguf ...
+ //
+ // Nothing happens without CORSIA_SOCKET, or when a program installs its own eval callback.
++//
++// Looking ahead: while generating, the hidden state entering layer L's experts is run
++// through layer L+1's own norm and router (a small matrix-vector product) to guess which
++// experts L+1 will pick. Those are prefetched in the background while L computes, so the
++// drives work during compute instead of after it. CORSIA_PREDICT=0 turns this off;
++// CORSIA_PREDICT_EXTRA (default 4) adds that many guesses beyond the model's top-k.
++// The run ends with the share of experts that were guessed right.
+ 
+ #include "../src/corsia-client.h"
+ #include "ggml.h"
+@@ -21,9 +28,14 @@
+ #include "log.h"
+ #include "llama.h"
+ 
++#include <fcntl.h>
++#include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <sys/vfs.h>
+ 
++#include <algorithm>
++#include <cmath>
++
+ #include <cerrno>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -39,8 +51,16 @@ struct corsia_experts {
+         int64_t n_expert;
+     };
+ 
++    // The next layer's router, for guessing ahead. Offsets into the model file.
++    struct router {
++        uint64_t w = 0, norm = 0, bias = 0; // 0 = absent
++        ggml_type type = GGML_TYPE_F32;
++        int64_t n_embd = 0, n_expert = 0;
++    };
++
+     corsia_client * client = nullptr;
+     std::vector<std::vector<tensor>> layers; // per layer: gate, up, down or fused gate_up
++    std::vector<router> routers;             // per layer
+     std::vector<int32_t> ids;
+     std::vector<uint8_t> want;
+     std::vector<corsia_range> ranges;
+@@ -48,14 +68,34 @@ struct corsia_experts {
+     uint64_t bytes = 0;
+     bool broken = false;
+ 
++    // Read-only view of the model file; its pages are shared with llama.cpp's own mapping.
++    const uint8_t * map = nullptr;
++    size_t map_len = 0;
++    float eps = 1e-6f;
++    int n_used = 0;
++    int extra = 4;
++    bool predict_on = true;
++    std::vector<std::vector<int32_t>> guessed; // per layer, guessed from the layer before
++    uint64_t guess_hits = 0, guess_total = 0, guesses_sent = 0;
++    std::vector<float> x, h, logits;
++    std::vector<int32_t> order;
++
+     ~corsia_experts() {
+         if (client) {
+             corsia_close(client);
+         }
++        if (map) {
++            munmap((void *) map, map_len);
++        }
+         if (requests) {
+             LOG_INF("corsia: %llu expert prefetches, %llu MiB put in memory ahead of use\n",
+                 (unsigned long long) requests, (unsigned long long) (bytes >> 20));
+         }
++        if (guess_total) {
++            LOG_INF("corsia: guessed %llu of %llu experts one layer ahead (%.0f%%), %llu background prefetches\n",
++                (unsigned long long) guess_hits, (unsigned long long) guess_total,
++                100.0 * guess_hits / guess_total, (unsigned long long) guesses_sent);
++        }
+     }
+ 
+     // Reads where every layer's expert tensors live in the file.
+@@ -67,14 +107,47 @@ struct corsia_experts {
+             return false;
+         }
+         const uint64_t data = gguf_get_data_offset(g);
++        for (int64_t k = 0; k < gguf_get_n_kv(g); k++) {
++            const std::string key = gguf_get_key(g, k);
++            auto ends = [&](const char * suffix) {
++                const size_t n = std::strlen(suffix);
++                return key.size() > n && key.compare(key.size() - n, n, suffix) == 0;
++            };
++            if (ends(".attention.layer_norm_rms_epsilon") && gguf_get_kv_type(g, k) == GGUF_TYPE_FLOAT32) {
++                eps = gguf_get_val_f32(g, k);
++            } else if (ends(".expert_used_count") && gguf_get_kv_type(g, k) == GGUF_TYPE_UINT32) {
++                n_used = (int) gguf_get_val_u32(g, k);
++            }
++        }
+         for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+             const char * name = gguf_get_tensor_name(g, i);
+             int il = -1;
+             char kind[32] = {0};
+-            if (std::sscanf(name, "blk.%d.ffn_%31[a-z_]", &il, kind) != 2 || il < 0) {
++            const ggml_tensor * tt = ggml_get_tensor(meta, name);
++            int used = 0; // sscanf counts %d even when the rest of the name does not match
++            if (tt && std::sscanf(name, "blk.%d.exp_probs_b.bias%n", &il, &used) == 1 && used == (int) std::strlen(name) && il >= 0) {
++                router_at(il).bias = data + gguf_get_tensor_offset(g, i);
++                continue;
++            }
++            if (std::sscanf(name, "blk.%d.ffn_%31[a-z_]", &il, kind) != 2 || il < 0 || tt == nullptr) {
+                 continue;
+             }
+             const std::string k = kind;
++            if (k == "gate_inp" && tt->type != GGML_TYPE_F32 && tt->type != GGML_TYPE_F16 && tt->type != GGML_TYPE_BF16) {
++                continue; // routers are kept unquantized; anything else is not guessed from
++            }
++            if (k == "gate_inp") {
++                router & r = router_at(il);
++                r.w = data + gguf_get_tensor_offset(g, i);
++                r.type = tt->type;
++                r.n_embd = tt->ne[0];
++                r.n_expert = tt->ne[1];
++                continue;
++            }
++            if (k == "norm" && tt->type == GGML_TYPE_F32) {
++                router_at(il).norm = data + gguf_get_tensor_offset(g, i);
++                continue;
++            }
+             if (k != "gate_exps" && k != "up_exps" && k != "down_exps" && k != "gate_up_exps") {
+                 continue;
+             }
+@@ -89,7 +162,90 @@ struct corsia_experts {
+         }
+         gguf_free(g);
+         ggml_free(meta);
+-        return !layers.empty();
++        if (layers.empty()) {
++            return false;
++        }
++        // The model file, mapped read-only, to read router weights where llama.cpp has them.
++        const int fd = open(path, O_RDONLY | O_CLOEXEC);
++        struct stat st = {};
++        if (fd >= 0 && fstat(fd, &st) == 0) {
++            void * m = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
++            if (m != MAP_FAILED) {
++                map = (const uint8_t *) m;
++                map_len = (size_t) st.st_size;
++            }
++        }
++        if (fd >= 0) {
++            close(fd);
++        }
++        guessed.resize(layers.size());
++        return true;
++    }
++
++    router & router_at(int il) {
++        if ((size_t) il >= routers.size()) {
++            routers.resize(il + 1);
++        }
++        return routers[il];
++    }
++
++    // Guesses layer il+1's experts from the hidden state entering layer il's experts and
++    // prefetches them in the background. Generation only (one token at a time).
++    void predict_next(const ggml_tensor * inp, int il) {
++        const int t = il + 1;
++        if (!predict_on || broken || map == nullptr || inp->type != GGML_TYPE_F32 || inp->ne[1] != 1 ||
++            t >= (int) routers.size() || t >= (int) layers.size() || layers[t].empty()) {
++            return;
++        }
++        const router & r = routers[t];
++        const int64_t n = inp->ne[0];
++        if (r.w == 0 || r.n_embd != n || r.n_expert < 2) {
++            return;
++        }
++        x.resize(n);
++        h.resize(n);
++        ggml_backend_tensor_get(inp, x.data(), 0, n * sizeof(float));
++        double ss = 0;
++        for (float v : x) {
++            ss += (double) v * v;
++        }
++        const float scale = 1.0f / std::sqrt((float) (ss / n) + eps);
++        const float * norm = r.norm ? (const float *) (map + r.norm) : nullptr;
++        for (int64_t i = 0; i < n; i++) {
++            h[i] = x[i] * scale * (norm ? norm[i] : 1.0f);
++        }
++        logits.resize(r.n_expert);
++        for (int64_t e = 0; e < r.n_expert; e++) {
++            double acc = 0;
++            if (r.type == GGML_TYPE_F32) {
++                const float * w = (const float *) (map + r.w) + e * n;
++                for (int64_t i = 0; i < n; i++) acc += w[i] * h[i];
++            } else if (r.type == GGML_TYPE_F16) {
++                const ggml_fp16_t * w = (const ggml_fp16_t *) (map + r.w) + e * n;
++                for (int64_t i = 0; i < n; i++) acc += ggml_fp16_to_fp32(w[i]) * h[i];
++            } else {
++                const ggml_bf16_t * w = (const ggml_bf16_t *) (map + r.w) + e * n;
++                for (int64_t i = 0; i < n; i++) acc += ggml_bf16_to_fp32(w[i]) * h[i];
++            }
++            logits[e] = (float) acc + (r.bias ? ((const float *) (map + r.bias))[e] : 0.0f);
++        }
++        const int k = std::min<int>((int) r.n_expert, (n_used > 0 ? n_used : 8) + extra);
++        order.resize(r.n_expert);
++        for (int64_t e = 0; e < r.n_expert; e++) order[e] = (int32_t) e;
++        std::partial_sort(order.begin(), order.begin() + k, order.end(),
++            [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
++        guessed[t].assign(order.begin(), order.begin() + k);
++        ranges.clear();
++        for (const tensor & tn : layers[t]) {
++            for (int32_t e : guessed[t]) {
++                if (e < tn.n_expert && tn.stride <= UINT32_MAX) {
++                    ranges.push_back({ tn.offs + e * tn.stride, (uint32_t) tn.stride, 0 });
++                }
++            }
++        }
++        if (!ranges.empty() && ranges.size() <= CORSIA_MAX_RANGES && corsia_prefetch_async(client, ranges.data(), ranges.size()) == 0) {
++            guesses_sent++;
++        }
+     }
+ 
+     // The router output for layer `il`: I32 [n_expert_used, n_tokens], possibly a view.
+@@ -97,18 +253,26 @@ struct corsia_experts {
+         if (broken || il < 0 || (size_t) il >= layers.size() || layers[il].empty() || topk->type != GGML_TYPE_I32) {
+             return;
+         }
+-        const int64_t n_used = topk->ne[0];
++        const int64_t k_used = topk->ne[0];
+         const int64_t n_tok = topk->ne[1];
+         const int64_t n_expert = layers[il][0].n_expert;
+         want.assign(n_expert, 0);
+-        ids.resize(n_used);
++        ids.resize(k_used);
+         for (int64_t r = 0; r < n_tok; r++) {
+-            ggml_backend_tensor_get(topk, ids.data(), r * topk->nb[1], n_used * sizeof(int32_t));
++            ggml_backend_tensor_get(topk, ids.data(), r * topk->nb[1], k_used * sizeof(int32_t));
+             for (int32_t e : ids) {
+                 if (e >= 0 && e < n_expert) {
+                     want[e] = 1;
+                 }
+             }
++            // Score the guess made one layer earlier (generation: one token).
++            if (n_tok == 1 && !guessed[il].empty()) {
++                for (int32_t e : ids) {
++                    guess_total++;
++                    guess_hits += std::find(guessed[il].begin(), guessed[il].end(), e) != guessed[il].end();
++                }
++                guessed[il].clear();
++            }
+         }
+         ranges.clear();
+         for (const tensor & t : layers[il]) {
+@@ -132,13 +296,18 @@ struct corsia_experts {
+     }
+ 
+     static bool eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+-        static const char prefix[] = "ffn_moe_topk-";
+-        const bool topk = std::strncmp(t->name, prefix, sizeof(prefix) - 1) == 0;
++        static const char topk_prefix[] = "ffn_moe_topk-";
++        static const char inp_prefix[] = "ffn_inp-";
++        auto * self = static_cast<corsia_experts *>(user_data);
++        const bool topk = std::strncmp(t->name, topk_prefix, sizeof(topk_prefix) - 1) == 0;
++        const bool inp = self->predict_on && std::strncmp(t->name, inp_prefix, sizeof(inp_prefix) - 1) == 0;
+         if (ask) {
+-            return topk; // see only the router outputs
++            return topk || inp; // see only the router outputs and the hidden states before them
+         }
+-        if (topk) {
+-            static_cast<corsia_experts *>(user_data)->prefetch(t, std::atoi(t->name + sizeof(prefix) - 1));
++        if (inp) {
++            self->predict_next(t, std::atoi(t->name + sizeof(inp_prefix) - 1));
++        } else if (topk) {
++            self->prefetch(t, std::atoi(t->name + sizeof(topk_prefix) - 1));
+         }
+         return true; // keep computing
+     }
+@@ -174,7 +343,21 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+             LOG_WRN("corsia: serves a different file than %s; not prefetching\n", model_path.c_str());
+             return;
+         }
+-        LOG_INF("corsia: streaming experts for %zu layers through %s\n", s->layers.size(), socket);
++        if (const char * p = std::getenv("CORSIA_PREDICT")) {
++            s->predict_on = std::strcmp(p, "0") != 0;
++        }
++        if (const char * e = std::getenv("CORSIA_PREDICT_EXTRA")) {
++            s->extra = std::max(0, std::atoi(e));
++        }
++        size_t with_router = 0;
++        for (const auto & r : s->routers) {
++            with_router += r.w != 0;
++        }
++        if (with_router == 0 || s->map == nullptr) {
++            s->predict_on = false;
++        }
++        LOG_INF("corsia: streaming experts for %zu layers through %s; guessing ahead %s (%zu routers, top %d + %d)\n",
++            s->layers.size(), socket, s->predict_on ? "on" : "off", with_router, s->n_used, s->extra);
+         instance = std::move(s);
+     }
+     if (instance) {
+diff --git a/src/corsia-client.h b/src/corsia-client.h
+index f1105af..a6f5a31 100644
+--- a/src/corsia-client.h
++++ b/src/corsia-client.h
+@@ -232,25 +232,30 @@ static inline int corsia_read(corsia_client *c, const corsia_range *r, size_t n,
+  * (offset and len; arena_off is ignored) from its drives and stores them straight into
+  * the kernel's page cache for the mounted file, then returns. 0 on success, -1 with
+  * errno set on failure. If bytes is not NULL it receives the bytes stored. */
+-static inline int corsia_prefetch(corsia_client *c, const corsia_range *r, size_t n, uint64_t *bytes) {
++static inline int corsia__send_prefetch(corsia_client *c, const corsia_range *r, size_t n, uint32_t flags) {
+     uint8_t *m = c->msg;
+     size_t i;
+-    ssize_t got;
+-    int32_t status;
+-
+     if (n == 0 || n > CORSIA_MAX_RANGES) { errno = EINVAL; return -1; }
+     c->batch++;
+     corsia__header(m, 0x02);
+     corsia__put64(m + CORSIA_HEAD, c->batch);
+     corsia__put32(m + CORSIA_HEAD + 8, (uint32_t)n);
+-    corsia__put32(m + CORSIA_HEAD + 12, 0);
++    corsia__put32(m + CORSIA_HEAD + 12, flags);
+     for (i = 0; i < n; i++) {
+         uint8_t *e = m + CORSIA_HEAD + 16 + i * 16;
+         corsia__put64(e, r[i].offset);
+         corsia__put32(e + 8, r[i].len);
+         corsia__put32(e + 12, 0);
+     }
+-    if (corsia__send(c->fd, m, CORSIA_HEAD + 16 + n * 16, -1) != 0) return -1;
++    return corsia__send(c->fd, m, CORSIA_HEAD + 16 + n * 16, -1);
++}
++
++static inline int corsia_prefetch(corsia_client *c, const corsia_range *r, size_t n, uint64_t *bytes) {
++    uint8_t *m = c->msg;
++    ssize_t got;
++    int32_t status;
++
++    if (corsia__send_prefetch(c, r, n, 0) != 0) return -1;
+     got = corsia__recv(c->fd, m, CORSIA_MAX_MSG);
+     if (corsia__type(m, got) != 0x82 || got < (ssize_t)(CORSIA_HEAD + 24)) { errno = EPROTO; return -1; }
+     memcpy(&status, m + CORSIA_HEAD + 8, 4);
+@@ -259,6 +264,13 @@ static inline int corsia_prefetch(corsia_client *c, const corsia_range *r, size_
+     return 0;
+ }
+ 
++/* Like corsia_prefetch but returns at once: Corsia works in the background and sends
++ * no reply. For guesses (the experts a later layer will probably need). If guesses pile
++ * up faster than the drives serve them, Corsia drops the oldest. */
++static inline int corsia_prefetch_async(corsia_client *c, const corsia_range *r, size_t n) {
++    return corsia__send_prefetch(c, r, n, 1);
++}
++
+ static inline void corsia_close(corsia_client *c) {
+     if (!c) return;
+     if (c->arena != (uint8_t *)MAP_FAILED) munmap(c->arena, c->arena_bytes);

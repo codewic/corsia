@@ -1,0 +1,809 @@
+From 43028c0c56977aea943f3a06bd2c51b1a9e911b1 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:31:10 +0000
+Subject: [PATCH] Add the expert pool, residency-aware routing and expert
+ skipping
+
+---
+ common/corsia-experts.h | 308 ++++++++++++++++++++++++++++++-
+ common/corsia-pool.h    | 393 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 697 insertions(+), 4 deletions(-)
+ create mode 100644 common/corsia-pool.h
+
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index a5cff43..771788a 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -23,9 +23,26 @@
+ //
+ // CORSIA_TRACE=path records which experts every generated token used in every layer, in
+ // Corsia's trace format (`corsia replay` reads it). It works without CORSIA_SOCKET too.
++//
++// Residency-aware routing (CORSIA_SWAP=1; on by default with the expert pool, off without
++// it; CORSIA_SWAP=0 turns it off): while generating, a chosen
++// expert that is not in memory yet is swapped for the best runner-up that is, when the
++// runner-up's router score is at least CORSIA_SWAP_RATIO (default 0.5) of the one it
++// replaces and it ranks within CORSIA_SWAP_DEPTH (default 8) places of the top-k. At most
++// CORSIA_SWAP_MAX (default 2) experts per layer change. The swap rewrites the router's
++// choice before llama.cpp gathers the expert weights, so the weights follow the new choice
++// and are normalised as usual. A layer whose missing experts are all swapped never waits
++// for the drives. It changes the output slightly: measure it before trusting it.
++//
++// Confidence-based skipping (CORSIA_SKIP=0.05, off by default): while generating, a chosen
++// expert whose share of the layer's normalised weight is below the threshold is skipped,
++// keeping at least CORSIA_SKIP_MIN (default 4). Its weight becomes 0 and the rest are
++// renormalised, and its slot is pointed at the heaviest chosen expert, so it costs no
++// read. The tail experts move the output least and cost as much to fetch as the head.
+ 
+ #include "../src/corsia-client.h"
+ #include "corsia-threads.h"
++#include "corsia-pool.h"
+ #include "ggml.h"
+ #include "ggml-backend.h"
+ #include "gguf.h"
+@@ -53,6 +70,7 @@ struct corsia_experts {
+         uint64_t offs;   // file offset of expert 0
+         uint64_t stride; // bytes per expert
+         int64_t n_expert;
++        std::string name; // the tensor's name in the model
+     };
+ 
+     // The next layer's router, for guessing ahead. Offsets into the model file.
+@@ -84,6 +102,26 @@ struct corsia_experts {
+     std::vector<float> x, h, logits;
+     std::vector<int32_t> order;
+ 
++    // The expert pool (CORSIA_POOL_MIB): experts in engine-owned memory instead of the page cache.
++    std::unique_ptr<corsia_pool> pool;
++
++    // Residency-aware routing (CORSIA_SWAP).
++    bool swap_on = false;
++    float swap_ratio = 0.5f;
++    int swap_max = 2;
++    int swap_depth = 8;
++    int probs_layer = -1;      // layer whose router probabilities are in probs_row
++    std::vector<float> probs_row;
++    std::vector<unsigned char> core;
++    uint64_t swap_layers = 0, swap_experts = 0, miss_layers = 0, stalls_avoided = 0;
++
++    // Confidence-based skipping (CORSIA_SKIP).
++    float skip_below = 0.0f;
++    int skip_min = 4;
++    int drop_layer = -1;
++    std::vector<uint8_t> drop; // per top-k slot, for the layer in drop_layer
++    uint64_t skipped_experts = 0, skip_chances = 0;
++
+     // Routing trace (CORSIA_TRACE): one line per generated token, one group per layer.
+     FILE * trace = nullptr;
+     std::vector<std::vector<int32_t>> trace_tok;
+@@ -104,6 +142,15 @@ struct corsia_experts {
+             LOG_INF("corsia: %llu expert prefetches, %llu MiB put in memory ahead of use\n",
+                 (unsigned long long) requests, (unsigned long long) (bytes >> 20));
+         }
++        if (skip_below > 0 && skip_chances) {
++            LOG_INF("corsia: skipped %llu of %llu chosen experts whose weight was under %.3f (%.1f%%)\n",
++                (unsigned long long) skipped_experts, (unsigned long long) skip_chances, skip_below,
++                100.0 * skipped_experts / skip_chances);
++        }
++        if (swap_on && miss_layers) {
++            LOG_INF("corsia: swapped %llu experts for ones already in memory; %llu of %llu layers that had a missing expert did not wait for the drives\n",
++                (unsigned long long) swap_experts, (unsigned long long) stalls_avoided, (unsigned long long) miss_layers);
++        }
+         if (guess_total) {
+             LOG_INF("corsia: guessed %llu of %llu experts one layer ahead (%.0f%%), %llu background prefetches\n",
+                 (unsigned long long) guess_hits, (unsigned long long) guess_total,
+@@ -171,7 +218,7 @@ struct corsia_experts {
+             if ((size_t) il >= layers.size()) {
+                 layers.resize(il + 1);
+             }
+-            layers[il].push_back({ data + gguf_get_tensor_offset(g, i), ggml_nbytes(t) / (uint64_t) t->ne[2], t->ne[2] });
++            layers[il].push_back({ data + gguf_get_tensor_offset(g, i), ggml_nbytes(t) / (uint64_t) t->ne[2], t->ne[2], name });
+         }
+         gguf_free(g);
+         ggml_free(meta);
+@@ -251,6 +298,9 @@ struct corsia_experts {
+         ranges.clear();
+         for (const tensor & tn : layers[t]) {
+             for (int32_t e : guessed[t]) {
++                if (pool && pool->has(t, e)) {
++                    continue; // already in the pool: fetching it again would only crowd the pool out
++                }
+                 if (e < tn.n_expert && tn.stride <= UINT32_MAX) {
+                     ranges.push_back({ tn.offs + e * tn.stride, (uint32_t) tn.stride, 0 });
+                 }
+@@ -291,7 +341,162 @@ struct corsia_experts {
+         traced++;
+     }
+ 
+-    void prefetch(const ggml_tensor * topk, int il) {
++    // True when every slice of expert `e` in layer `il` is in the page cache.
++    bool resident(int il, int64_t e) {
++        if (pool && pool->has(il, (int32_t) e)) {
++            return true; // otherwise: in the page cache counts too, the pool copies it in at memory speed
++        }
++        const uint64_t page = 4096;
++        for (const tensor & t : layers[il]) {
++            const uint64_t a = (t.offs + e * t.stride) / page * page;
++            const uint64_t b = std::min<uint64_t>(t.offs + (e + 1) * t.stride, map_len);
++            if (b <= a) {
++                continue;
++            }
++            const size_t n = (b - a + page - 1) / page;
++            core.resize(n);
++            if (mincore((void *) (map + a), b - a, core.data()) != 0) {
++                return false;
++            }
++            for (size_t i = 0; i < n; i++) {
++                if (!(core[i] & 1)) {
++                    return false;
++                }
++            }
++        }
++        return true;
++    }
++
++    // Keeps the router's probabilities for one generated token, for swap().
++    void keep_probs(const ggml_tensor * probs, int il) {
++        if (probs->type != GGML_TYPE_F32 || probs->ne[1] != 1) {
++            probs_layer = -1;
++            return;
++        }
++        probs_row.resize(probs->ne[0]);
++        ggml_backend_tensor_get(probs, probs_row.data(), 0, probs->ne[0] * sizeof(float));
++        probs_layer = il;
++    }
++
++    // Swaps chosen experts that are not in memory for close runners-up that are, and
++    // writes the new choice back into the router output. Returns true if anything changed.
++    bool swap(int il) {
++        if (probs_layer != il || map == nullptr || (size_t) il >= routers.size() || routers[il].bias != 0) {
++            return false;
++        }
++        const int64_t n_expert = (int64_t) probs_row.size();
++        std::vector<int32_t> missing;
++        for (int32_t e : ids) {
++            if (e >= 0 && e < n_expert && !resident(il, e)) {
++                missing.push_back(e);
++            }
++        }
++        if (missing.empty()) {
++            return false;
++        }
++        miss_layers++;
++        order.resize(n_expert);
++        for (int64_t i = 0; i < n_expert; i++) {
++            order[i] = (int32_t) i;
++        }
++        const size_t depth = std::min<size_t>(ids.size() + swap_depth, n_expert);
++        std::partial_sort(order.begin(), order.begin() + depth, order.end(),
++            [&](int32_t a, int32_t b) { return probs_row[a] > probs_row[b]; });
++        std::vector<int32_t> spare;
++        for (size_t i = 0; i < depth; i++) {
++            const int32_t e = order[i];
++            if (std::find(ids.begin(), ids.end(), e) == ids.end() && resident(il, e)) {
++                spare.push_back(e); // best first
++            }
++        }
++        // Lightest missing experts first: they matter least, so they are the safest to swap.
++        std::sort(missing.begin(), missing.end(), [&](int32_t a, int32_t b) { return probs_row[a] < probs_row[b]; });
++        int changed = 0;
++        size_t next = 0;
++        for (int32_t m : missing) {
++            if (changed >= swap_max || next >= spare.size() || probs_row[spare[next]] < swap_ratio * probs_row[m]) {
++                break;
++            }
++            std::replace(ids.begin(), ids.end(), m, spare[next++]); // skipped slots may repeat it
++            changed++;
++        }
++        if (changed == 0) {
++            return false;
++        }
++        swap_layers++;
++        swap_experts += changed;
++        stalls_avoided += changed == (int) missing.size();
++        return true;
++    }
++
++    // Marks light experts to skip and points their slots at the heaviest one. Returns true
++    // if the choice changed (the caller writes it back).
++    bool skip(int il) {
++        drop_layer = -1;
++        if (probs_layer != il || ids.size() <= (size_t) skip_min) {
++            return false;
++        }
++        double sum = 0;
++        for (int32_t e : ids) {
++            sum += (e >= 0 && e < (int32_t) probs_row.size()) ? probs_row[e] : 0.0f;
++        }
++        if (sum <= 0) {
++            return false;
++        }
++        std::vector<size_t> by(ids.size());
++        for (size_t i = 0; i < by.size(); i++) {
++            by[i] = i;
++        }
++        std::sort(by.begin(), by.end(), [&](size_t a, size_t b) { return probs_row[ids[a]] > probs_row[ids[b]]; });
++        drop.assign(ids.size(), 0);
++        int dropped = 0;
++        for (size_t r = (size_t) skip_min; r < by.size(); r++) {
++            if (probs_row[ids[by[r]]] / sum < skip_below) {
++                drop[by[r]] = 1;
++                dropped++;
++            }
++        }
++        skip_chances += ids.size();
++        if (dropped == 0) {
++            return false;
++        }
++        const int32_t heaviest = ids[by[0]];
++        for (size_t i = 0; i < ids.size(); i++) {
++            if (drop[i]) {
++                ids[i] = heaviest;
++            }
++        }
++        skipped_experts += dropped;
++        drop_layer = il;
++        return true;
++    }
++
++    // Zeroes the skipped slots' weights and renormalises the rest (one generated token).
++    void zero_skipped(ggml_tensor * w, int il) {
++        if (drop_layer != il || w->type != GGML_TYPE_F32 || w->ne[0] != (int64_t) drop.size() || ggml_nelements(w) != w->ne[0]) {
++            return;
++        }
++        std::vector<float> v(drop.size());
++        ggml_backend_tensor_get(w, v.data(), 0, v.size() * sizeof(float));
++        double kept = 0;
++        for (size_t i = 0; i < v.size(); i++) {
++            if (drop[i]) {
++                v[i] = 0.0f;
++            } else {
++                kept += v[i];
++            }
++        }
++        if (kept <= 0) {
++            return;
++        }
++        for (float & x : v) {
++            x = (float) (x / kept);
++        }
++        ggml_backend_tensor_set(w, v.data(), 0, v.size() * sizeof(float));
++        drop_layer = -1;
++    }
++
++    void prefetch(ggml_tensor * topk, int il) {
+         if (il < 0 || (size_t) il >= layers.size() || layers[il].empty() || topk->type != GGML_TYPE_I32) {
+             return;
+         }
+@@ -319,6 +524,21 @@ struct corsia_experts {
+         if (trace && n_tok == 1) {
+             record(il, ids);
+         }
++        bool changed = skip_below > 0 && n_tok == 1 && skip(il);
++        changed = (swap_on && n_tok == 1 && swap(il)) || changed;
++        if (changed) {
++            ggml_backend_tensor_set(topk, ids.data(), 0, ids.size() * sizeof(int32_t));
++            want.assign(n_expert, 0);
++            for (int32_t e : ids) {
++                if (e >= 0 && e < n_expert) {
++                    want[e] = 1;
++                }
++            }
++        }
++        if (pool) {
++            pool->ensure(il, want); // read straight into the pool; the matmul is pointed there
++            return;
++        }
+         if (broken || client == nullptr) {
+             return;
+         }
+@@ -343,16 +563,40 @@ struct corsia_experts {
+         bytes += got;
+     }
+ 
++    // The layer number when `name` is exactly prefix + digits, else -1. ggml also names
++    // views of a tensor after it ("ffn_moe_probs-3 (reshaped)"), which must not match.
++    static int layer_of(const char * name, const char * prefix, size_t n) {
++        if (std::strncmp(name, prefix, n) != 0 || name[n] < '0' || name[n] > '9') {
++            return -1;
++        }
++        const char * p = name + n;
++        while (*p >= '0' && *p <= '9') {
++            p++;
++        }
++        return *p == '\0' ? std::atoi(name + n) : -1;
++    }
++
+     static bool eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+         static const char topk_prefix[] = "ffn_moe_topk-";
+         static const char inp_prefix[] = "ffn_inp-";
++        static const char probs_prefix[] = "ffn_moe_probs-";
+         auto * self = static_cast<corsia_experts *>(user_data);
+         const bool topk = std::strncmp(t->name, topk_prefix, sizeof(topk_prefix) - 1) == 0;
+         const bool inp = self->predict_on && std::strncmp(t->name, inp_prefix, sizeof(inp_prefix) - 1) == 0;
++        static const char wnorm_prefix[] = "ffn_moe_weights_norm-";
++        const bool probs = (self->swap_on || self->skip_below > 0) && layer_of(t->name, probs_prefix, sizeof(probs_prefix) - 1) >= 0;
++        const bool wnorm = self->skip_below > 0 && layer_of(t->name, wnorm_prefix, sizeof(wnorm_prefix) - 1) >= 0;
+         if (ask) {
+-            return topk || inp; // see only the router outputs and the hidden states before them
++            if (self->pool && t->op == GGML_OP_MUL_MAT_ID) {
++                self->pool->register_tensor(t->src[0]); // once per weight tensor
++            }
++            return topk || inp || probs || wnorm; // see only the router outputs and the hidden states before them
+         }
+-        if (inp) {
++        if (wnorm) {
++            self->zero_skipped(t, std::atoi(t->name + sizeof(wnorm_prefix) - 1));
++        } else if (probs) {
++            self->keep_probs(t, std::atoi(t->name + sizeof(probs_prefix) - 1));
++        } else if (inp) {
+             self->predict_next(t, std::atoi(t->name + sizeof(inp_prefix) - 1));
+         } else if (topk) {
+             self->prefetch(t, std::atoi(t->name + sizeof(topk_prefix) - 1));
+@@ -425,8 +669,64 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+         if (with_router == 0 || s->map == nullptr) {
+             s->predict_on = false;
+         }
++        if (const char * w = std::getenv("CORSIA_SWAP")) {
++            s->swap_on = std::strcmp(w, "0") != 0 && s->map != nullptr;
++        }
++        if (const char * w = std::getenv("CORSIA_SWAP_RATIO")) {
++            s->swap_ratio = std::max(0.0f, (float) std::atof(w));
++        }
++        if (const char * w = std::getenv("CORSIA_SWAP_MAX")) {
++            s->swap_max = std::max(0, std::atoi(w));
++        }
++        if (const char * w = std::getenv("CORSIA_SWAP_DEPTH")) {
++            s->swap_depth = std::max(0, std::atoi(w));
++        }
++        if (const char * w = std::getenv("CORSIA_SKIP")) {
++            s->skip_below = std::max(0.0f, (float) std::atof(w));
++        }
++        if (const char * w = std::getenv("CORSIA_SKIP_MIN")) {
++            s->skip_min = std::max(1, std::atoi(w));
++        }
++        if (s->skip_below > 0) {
++            LOG_INF("corsia: skipping chosen experts under %.3f of their layer's weight, keeping at least %d\n", s->skip_below, s->skip_min);
++        }
+         LOG_INF("corsia: streaming experts for %zu layers through %s; guessing ahead %s (%zu routers, top %d + %d)\n",
+             s->layers.size(), socket, s->predict_on ? "on" : "off", with_router, s->n_used, s->extra);
++        if (const char * pm = std::getenv("CORSIA_POOL_MIB"); pm && std::atoll(pm) > 0) {
++            std::vector<std::vector<corsia_pool::slice>> slices(s->layers.size());
++            for (size_t il = 0; il < s->layers.size(); il++) {
++                for (const auto & t : s->layers[il]) {
++                    slices[il].push_back({ t.name, t.offs, t.stride });
++                }
++            }
++            auto p = std::make_unique<corsia_pool>();
++            int64_t experts = 0;
++            for (const auto & l : s->layers) {
++                if (!l.empty()) {
++                    experts = l[0].n_expert;
++                    break;
++                }
++            }
++            if (experts > 0 && p->init(socket, (uint64_t) std::atoll(pm) << 20, std::move(slices), experts, model_path)) {
++                LOG_INF("corsia: expert pool of %lld slots (%.1f MiB each): experts are read straight into it, not through the page cache\n",
++                    (long long) p->n_slots, p->slot_bytes / 1048576.0);
++                p->map = s->map;
++                p->map_len = s->map_len;
++                s->pool = std::move(p);
++                // Guessing ahead stays off with the pool: with about 90% of chosen experts
++                // already in the pool, guesses cost more drive time than the misses they hide
++                // (measured: 1.46 tok/s with guessing against 1.93 without, same conditions).
++                // Experts a guess or anything else left in the page cache are still copied in.
++                s->predict_on = false;
++                if (std::getenv("CORSIA_SWAP") == nullptr) {
++                    s->swap_on = true; // with the pool on, swapping is the default (CORSIA_SWAP=0 turns it off)
++                }
++            }
++        }
++        if (s->swap_on) {
++            LOG_INF("corsia: residency-aware routing on: up to %d experts per layer swapped for runners-up already in memory (score ratio %.2f, within %d places)\n",
++                s->swap_max, s->swap_ratio, s->swap_depth);
++        }
+         if (corsia_has_openmp()) {
+             LOG_INF("corsia: %d compute threads; a waiting thread spins %s before it sleeps\n", cparams.n_threads, corsia_cool_describe());
+         } else {
+diff --git a/common/corsia-pool.h b/common/corsia-pool.h
+new file mode 100644
+index 0000000..ff975c0
+--- /dev/null
++++ b/common/corsia-pool.h
+@@ -0,0 +1,393 @@
++#pragma once
++
++// The expert pool: experts live in memory the engine owns, not in the kernel's page cache.
++//
++// With CORSIA_POOL_MIB set (and CORSIA_SOCKET), a fixed block of shared memory is divided
++// into slots, one slot per (layer, expert) holding that expert's slices of the layer's
++// expert tensors. When a layer's router has chosen, the chosen experts that are not in the
++// pool are read by Corsia straight from its drives into free or least recently used slots,
++// in one request per layer, and ggml's expert matmul is pointed at the slots through the
++// CPU backend's expert pointer table. No page faults, no copies through the mount, no
++// kernel reclaim under a memory cap, and the engine decides exactly which experts stay.
++//
++// A missing expert whose pages are already in the page cache is copied into its slot at
++// memory speed instead of read from the drives.
++//
++// Anything that fails leaves the expert at its usual place in the memory-mapped file, so
++// the pool can only make a run faster, never wrong: the bytes are the same either way.
++//
++// The pool remembers which experts the model uses. At exit it writes a usage profile
++// (CORSIA_POOL_PROFILE, default ~/.cache/corsia/<model>.pool-profile), merged with the
++// runs before it, older runs counting half. At start it reads the profile and loads the
++// most used experts before the first token, so a run starts warm: on a real trace a pool
++// of 2,200 experts went from 84% to 98% of experts found in the first quarter of a run.
++
++#include "../src/corsia-client.h"
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "log.h"
++
++#include <sys/stat.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <fstream>
++#include <sstream>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++struct corsia_pool {
++    struct slice {
++        std::string name; // the weight tensor's name in the model
++        uint64_t offs;    // file offset of expert 0
++        uint64_t stride;  // bytes per expert
++    };
++
++    corsia_client * io = nullptr;
++    uint8_t * base = nullptr;
++    uint64_t slot_bytes = 0;
++    int64_t n_slots = 0;
++    int64_t n_expert = 0;
++    std::vector<std::vector<slice>> layers;                       // per layer: its expert tensors
++    std::vector<std::vector<std::vector<const void *>>> ptrs;     // [layer][tensor][expert] -> pool data or null
++    std::vector<std::vector<uint8_t>> registered;                 // [layer][tensor]
++    std::vector<int32_t> where;      // [layer * n_expert + expert] -> slot, -1 when not pooled
++    std::vector<int32_t> owner;      // [slot] -> layer * n_expert + expert, -1 when free
++    std::vector<uint64_t> last_use;  // [slot]
++    std::vector<double> uses;        // [layer * n_expert + expert], this run plus the profile
++    std::string profile;
++    uint64_t tick = 0;
++    uint64_t hits = 0, loads = 0, loaded_bytes = 0, failures = 0, registered_n = 0;
++    uint64_t copies = 0, copied_bytes = 0;
++    const uint8_t * map = nullptr; // the model file mapped read-only (shares the page cache)
++    size_t map_len = 0;
++    std::vector<unsigned char> core;
++
++    using set_fn = void (*)(const void * data, const void * const * ptrs);
++    set_fn set_ptrs = nullptr;
++
++    ~corsia_pool() {
++        save_profile();
++        if (hits + loads + copies) {
++            LOG_INF("corsia: expert pool: %lld slots of %.1f MiB, %llu of %llu chosen experts already there (%.0f%%), %llu MiB read into it, %llu experts (%llu MiB) copied in from guesses, %llu tensors pointed at it%s\n",
++                (long long) n_slots, slot_bytes / 1048576.0, (unsigned long long) hits, (unsigned long long) (hits + loads + copies),
++                100.0 * hits / (hits + loads + copies), (unsigned long long) (loaded_bytes >> 20),
++                (unsigned long long) copies, (unsigned long long) (copied_bytes >> 20), (unsigned long long) registered_n,
++                failures ? ", some reads failed (those experts used the mapped file)" : "");
++        }
++        if (io) {
++            corsia_close(io); // ggml's tables point into this memory; the process is ending
++        }
++    }
++
++    // Sizes the slots for the largest layer and connects with the pool as the shared arena.
++    bool init(const char * socket, uint64_t pool_bytes, std::vector<std::vector<slice>> in, int64_t experts, const std::string & model_path) {
++        layers = std::move(in);
++        n_expert = experts;
++        for (const auto & l : layers) {
++            uint64_t b = 0;
++            for (const slice & s : l) {
++                b += room(s.stride);
++            }
++            slot_bytes = std::max(slot_bytes, b);
++        }
++        if (slot_bytes == 0) {
++            return false;
++        }
++        n_slots = (int64_t) (pool_bytes / slot_bytes);
++        if (n_slots < n_expert) {
++            LOG_WRN("corsia: an expert pool of %llu MiB holds %lld experts, fewer than one layer's %lld; not using it\n",
++                (unsigned long long) (pool_bytes >> 20), (long long) n_slots, (long long) n_expert);
++            return false;
++        }
++        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
++        set_ptrs = reg ? (set_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_expert_ptrs") : nullptr;
++        if (set_ptrs == nullptr) {
++            LOG_WRN("corsia: this ggml has no expert pointer table; not using the expert pool\n");
++            return false;
++        }
++        char err[256] = {0};
++        io = corsia_connect(socket, (size_t) (n_slots * slot_bytes), err, sizeof(err));
++        if (io == nullptr) {
++            LOG_WRN("corsia: could not share an expert pool with Corsia (%s); not using it\n", err);
++            return false;
++        }
++        base = corsia_arena(io);
++        ptrs.resize(layers.size());
++        registered.resize(layers.size());
++        for (size_t il = 0; il < layers.size(); il++) {
++            ptrs[il].assign(layers[il].size(), std::vector<const void *>(n_expert, nullptr));
++            registered[il].assign(layers[il].size(), 0);
++        }
++        where.assign(layers.size() * n_expert, -1);
++        owner.assign(n_slots, -1);
++        last_use.assign(n_slots, 0);
++        uses.assign(layers.size() * n_expert, 0.0);
++        if (const char * pp = std::getenv("CORSIA_POOL_PROFILE"); pp && *pp) {
++            profile = pp;
++        } else if (const char * home = std::getenv("HOME")) {
++            const size_t slash = model_path.find_last_of('/');
++            profile = std::string(home) + "/.cache/corsia/" + model_path.substr(slash == std::string::npos ? 0 : slash + 1) + ".pool-profile";
++        }
++        warm();
++        return true;
++    }
++
++    // Reads the profile (one "layer expert uses" line each) and loads the most used experts.
++    void warm() {
++        std::ifstream in(profile);
++        if (!in) {
++            return;
++        }
++        std::string line;
++        std::vector<std::pair<double, int32_t>> ranked;
++        while (std::getline(in, line)) {
++            if (line.empty() || line[0] == '#') {
++                continue;
++            }
++            std::istringstream ls(line);
++            int64_t il = -1, e = -1;
++            double u = 0;
++            if (ls >> il >> e >> u && il >= 0 && (size_t) il < layers.size() && e >= 0 && e < n_expert && u > 0) {
++                uses[il * n_expert + e] = u * 0.5; // older runs count half
++                ranked.push_back({ u, (int32_t) (il * n_expert + e) });
++            }
++        }
++        std::sort(ranked.begin(), ranked.end(), [](auto & a, auto & b) { return a.first > b.first; });
++        if ((int64_t) ranked.size() > n_slots) {
++            ranked.resize(n_slots);
++        }
++        // One read per layer, like a layer's own demand.
++        const auto t0 = std::chrono::steady_clock::now();
++        std::vector<std::vector<uint8_t>> want(layers.size(), std::vector<uint8_t>(n_expert, 0));
++        for (auto & r : ranked) {
++            want[r.second / n_expert][r.second % n_expert] = 1;
++        }
++        const uint64_t before = loaded_bytes;
++        for (size_t il = 0; il < layers.size(); il++) {
++            if (std::find(want[il].begin(), want[il].end(), 1) != want[il].end()) {
++                ensure((int) il, want[il], false);
++            }
++        }
++        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++        LOG_INF("corsia: expert pool warmed from %s: %lld experts, %.0f MiB in %.1f s\n", profile.c_str(),
++            (long long) loads, (loaded_bytes - before) / 1048576.0, secs);
++        loads = 0;
++        hits = 0;
++        loaded_bytes = 0;
++    }
++
++    // Writes this run's usage merged with the profile it started from.
++    void save_profile() const {
++        if (profile.empty() || uses.empty()) {
++            return;
++        }
++        const size_t slash = profile.find_last_of('/');
++        if (slash != std::string::npos) {
++            const std::string dir = profile.substr(0, slash);
++            for (size_t i = 1; i <= dir.size(); i++) { // mkdir -p without a shell
++                if (i == dir.size() || dir[i] == '/') {
++                    mkdir(dir.substr(0, i).c_str(), 0700);
++                }
++            }
++        }
++        const std::string tmp = profile + ".new";
++        std::ofstream out(tmp);
++        if (!out) {
++            return;
++        }
++        out << "# corsia-pool-profile 1: layer expert uses (older runs count half)\n";
++        for (size_t k = 0; k < uses.size(); k++) {
++            if (uses[k] >= 0.5) {
++                out << k / n_expert << ' ' << k % n_expert << ' ' << uses[k] << '\n';
++            }
++        }
++        out.close();
++        if (out) {
++            std::rename(tmp.c_str(), profile.c_str());
++        }
++    }
++
++    // Room one slice takes in a slot: Corsia needs len + 8192 bytes, page aligned.
++    static uint64_t room(uint64_t stride) {
++        return (stride + 8192 + 4095) / 4096 * 4096;
++    }
++
++    // Called for every expert matmul node: hands its weight tensor's pointer table to ggml once.
++    void register_tensor(const ggml_tensor * w) {
++        if (w == nullptr || w->data == nullptr) {
++            return;
++        }
++        int il = -1;
++        if (std::sscanf(w->name, "blk.%d.", &il) != 1 || il < 0 || (size_t) il >= layers.size()) {
++            return;
++        }
++        for (size_t ti = 0; ti < layers[il].size(); ti++) {
++            if (!registered[il][ti] && layers[il][ti].name == w->name && w->ne[2] == n_expert) {
++                set_ptrs(w->data, ptrs[il][ti].data());
++                registered[il][ti] = 1;
++                registered_n++;
++            }
++        }
++    }
++
++    bool has(int il, int32_t e) const {
++        return (size_t) il < layers.size() && e >= 0 && e < n_expert && where[il * n_expert + e] >= 0;
++    }
++
++    // Makes sure every expert flagged in `want` is in the pool for layer `il`.
++    void ensure(int il, const std::vector<uint8_t> & want, bool count = true) {
++        if ((size_t) il >= layers.size() || layers[il].empty()) {
++            return;
++        }
++        tick++;
++        std::vector<int32_t> missing;
++        for (int64_t e = 0; e < n_expert && e < (int64_t) want.size(); e++) {
++            if (!want[e]) {
++                continue;
++            }
++            if (count) {
++                uses[il * n_expert + e] += 1.0;
++            }
++            const int32_t s = where[il * n_expert + e];
++            if (s >= 0) {
++                last_use[s] = tick;
++                hits++;
++            } else {
++                missing.push_back((int32_t) e);
++            }
++        }
++        if (missing.empty()) {
++            return;
++        }
++        // Slots for the missing experts: free ones first, then the least recently used,
++        // never one this layer is using right now (those were just touched).
++        std::vector<int32_t> slots;
++        for (int32_t s = 0; s < n_slots && slots.size() < missing.size(); s++) {
++            if (owner[s] < 0) {
++                slots.push_back(s);
++            }
++        }
++        while (slots.size() < missing.size()) {
++            int32_t best = -1;
++            for (int32_t s = 0; s < n_slots; s++) {
++                if (last_use[s] != tick && owner[s] >= 0 && (best < 0 || last_use[s] < last_use[best])) {
++                    best = s;
++                }
++            }
++            if (best < 0) {
++                break;
++            }
++            evict(best);
++            last_use[best] = tick; // reserved for this layer
++            slots.push_back(best);
++        }
++        // Experts whose pages a guess already put in the page cache are copied into their
++        // slot from the mapped file (memory speed); the rest are read from the drives.
++        const size_t per = layers[il].size();
++        std::vector<size_t> to_read; // indexes into missing/slots
++        for (size_t i = 0; i < slots.size(); i++) {
++            if (in_page_cache(il, missing[i])) {
++                uint64_t at = (uint64_t) slots[i] * slot_bytes;
++                for (size_t ti = 0; ti < per; ti++) {
++                    const slice & sl = layers[il][ti];
++                    const uint64_t off = sl.offs + (uint64_t) missing[i] * sl.stride;
++                    uint8_t * dst = base + at + off % 4096; // the same alignment a read would give
++                    std::memcpy(dst, map + off, sl.stride);
++                    ptrs[il][ti][missing[i]] = dst;
++                    copied_bytes += sl.stride;
++                    at += room(sl.stride);
++                }
++                take(slots[i], il, missing[i]);
++                copies++;
++            } else {
++                to_read.push_back(i);
++            }
++        }
++        if (to_read.empty()) {
++            return;
++        }
++        std::vector<corsia_range> ranges;
++        std::vector<size_t> tensor_of;
++        for (size_t i : to_read) {
++            uint64_t at = (uint64_t) slots[i] * slot_bytes;
++            for (size_t ti = 0; ti < per; ti++) {
++                const slice & sl = layers[il][ti];
++                ranges.push_back({ sl.offs + (uint64_t) missing[i] * sl.stride, (uint32_t) sl.stride, at });
++                tensor_of.push_back(ti);
++                at += room(sl.stride);
++            }
++        }
++        if (ranges.size() > CORSIA_MAX_RANGES) {
++            failures++;
++            return;
++        }
++        std::vector<corsia_landed> got(ranges.size());
++        if (corsia_read(io, ranges.data(), ranges.size(), got.data()) != 0) {
++            failures++;
++            return; // these experts stay at their usual place in the mapped file
++        }
++        for (size_t j = 0; j < to_read.size(); j++) {
++            const size_t i = to_read[j];
++            bool ok = true;
++            for (size_t r = j * per; r < (j + 1) * per; r++) {
++                ok = ok && got[r].got == ranges[r].len;
++            }
++            if (!ok) {
++                failures++;
++                continue;
++            }
++            for (size_t r = j * per; r < (j + 1) * per; r++) {
++                ptrs[il][tensor_of[r]][missing[i]] = base + got[r].data_off;
++                loaded_bytes += got[r].got;
++            }
++            take(slots[i], il, missing[i]);
++            loads++;
++        }
++    }
++
++    void take(int32_t slot, int il, int32_t e) {
++        owner[slot] = (int32_t) (il * n_expert + e);
++        where[il * n_expert + e] = slot;
++        last_use[slot] = tick;
++    }
++
++    // True when every slice of the expert is in the page cache of the mapped model file.
++    bool in_page_cache(int il, int32_t e) {
++        if (map == nullptr) {
++            return false;
++        }
++        for (const slice & sl : layers[il]) {
++            const uint64_t a = (sl.offs + (uint64_t) e * sl.stride) / 4096 * 4096;
++            const uint64_t b = std::min<uint64_t>(sl.offs + (uint64_t) (e + 1) * sl.stride, map_len);
++            const size_t n = (b - a + 4095) / 4096;
++            core.resize(n);
++            if (b <= a || mincore((void *) (map + a), b - a, core.data()) != 0) {
++                return false;
++            }
++            for (size_t i = 0; i < n; i++) {
++                if (!(core[i] & 1)) {
++                    return false;
++                }
++            }
++        }
++        return true;
++    }
++
++    void evict(int32_t s) {
++        const int32_t key = owner[s];
++        if (key < 0) {
++            return;
++        }
++        const int64_t il = key / n_expert, e = key % n_expert;
++        for (auto & t : ptrs[il]) {
++            t[e] = nullptr; // back to the mapped file until it is loaded again
++        }
++        where[key] = -1;
++        owner[s] = -1;
++    }
++};
+-- 
+2.53.0
+

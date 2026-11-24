@@ -1,0 +1,18 @@
+Results go to ~/.cache/corsia-build/stream-20261123-183157.log
+this checkout already has the Corsia changes (fork branch or patched earlier)
+== Cap 6 GiB, model 11 GiB, 32 tokens
+== llama.cpp: -c 2048 -fa on -ctk q8_0 -ctv q8_0 -b 256 -ub 256
+== stream
+0.00.166.045 I corsia: streaming experts for 48 layers through /run/user/1000/corsia/Qwen3-30B-A3B-UD-Q2_K_XL.gguf.sock; guessing ahead off (48 routers, top 8 + 0)
+0.00.166.067 I corsia: 2 compute threads; a waiting thread spins 10000 times before it sleeps
+3.59.839.871 I common_perf_print:        load time =   61304.51 ms
+3.59.839.875 I common_perf_print: prompt eval time =   61304.12 ms /    10 tokens ( 6130.41 ms per token,     0.16 tokens per second)
+3.59.839.878 I common_perf_print:        eval time =   66928.50 ms /    31 runs   ( 2158.98 ms per token,     0.46 tokens per second)
+4.00.091.012 I corsia: 1536 expert prefetches, 4011 MiB put in memory ahead of use
+heat: Corsia 55.5 CPU seconds (19.9 user, 35.6 system)
+heat: workingset_refault_file 1328349
+heat: pgfault 459149
+heat: pgmajfault 2147
+heat: 121.9 CPU seconds in 246.2 s (58.2 user, 63.7 system)
+heat: package peak 76 C, mean 58 C
+Done. Compare the 'eval time ... tokens per second' lines above (full output in ~/.cache/corsia-build/stream-20261123-183157.log).

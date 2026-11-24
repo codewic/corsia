@@ -1,0 +1,150 @@
+From e165bbd9a5c04604403e0414c3c0b3e809009038 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:02:03 +0000
+Subject: [PATCH] Let waiting threads sleep while Corsia streams experts
+
+---
+ common/arg.cpp          |  8 +++++
+ common/corsia-experts.h |  6 ++++
+ common/corsia-threads.h | 74 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 88 insertions(+)
+ create mode 100644 common/corsia-threads.h
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 4b71639..5efa3db 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1,4 +1,5 @@
+ #include "arg.h"
++#include "corsia-threads.h"
+ 
+ #include "build-info.h"
+ #include "chat.h"
+@@ -1257,6 +1258,8 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
+ }
+ 
+ bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
++    corsia_cool_threads(argv); // streaming through Corsia: waiting threads sleep instead of spinning
++
+     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
+     const common_params params_org = ctx_arg.params; // the example can modify the default params
+ 
+@@ -1278,6 +1281,11 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
+             exit(0);
+         }
+         params.lr.init();
++        if (corsia_streaming() && !corsia_has_openmp() &&
++            std::none_of(argv, argv + argc, [](const char * a) { return strcmp(a, "--poll") == 0; })) {
++            params.cpuparams.poll = 0; // llama.cpp's own thread pool: sleep while experts load
++            params.cpuparams_batch.poll = 0;
++        }
+     } catch (const std::invalid_argument & ex) {
+         fprintf(stderr, "%s\n", ex.what());
+         ctx_arg.params = params_org;
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index 91d6dff..dc7a44f 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -25,6 +25,7 @@
+ // Corsia's trace format (`corsia replay` reads it). It works without CORSIA_SOCKET too.
+ 
+ #include "../src/corsia-client.h"
++#include "corsia-threads.h"
+ #include "ggml.h"
+ #include "ggml-backend.h"
+ #include "gguf.h"
+@@ -417,6 +418,11 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+         }
+         LOG_INF("corsia: streaming experts for %zu layers through %s; guessing ahead %s (%zu routers, top %d + %d)\n",
+             s->layers.size(), socket, s->predict_on ? "on" : "off", with_router, s->n_used, s->extra);
++        if (corsia_has_openmp()) {
++            LOG_INF("corsia: %d compute threads; a waiting thread spins %s before it sleeps\n", cparams.n_threads, corsia_cool_describe());
++        } else {
++            LOG_INF("corsia: %d compute threads; waiting threads sleep at once\n", cparams.n_threads);
++        }
+         instance = std::move(s);
+     }
+     if (instance) {
+diff --git a/common/corsia-threads.h b/common/corsia-threads.h
+new file mode 100644
+index 0000000..033c524
+--- /dev/null
++++ b/common/corsia-threads.h
+@@ -0,0 +1,74 @@
++#pragma once
++
++// Cool waiting while Corsia streams experts.
++//
++// When the model is streamed, compute threads spend much of each token waiting for
++// experts to arrive from the drives. By default the OpenMP runtime keeps a waiting thread
++// spinning at full power for a while before it sleeps, and every wait in a streamed token
++// pays that again: heat and fan noise for no work. With CORSIA_SOCKET set, this makes
++// waiting threads give up the core quickly instead.
++//
++// The OpenMP runtime reads its settings once, before main(), so the setting is made by
++// starting the program again with it in the environment. That happens once, at the very
++// start, before anything is loaded. Builds without OpenMP get polling level 0 instead
++// (the same idea for llama.cpp's own thread pool), unless --poll was given.
++//
++// Your own OMP_WAIT_POLICY or GOMP_SPINCOUNT always wins. CORSIA_COOL=0 turns this off.
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <strings.h>
++
++#if defined(__linux__)
++#include <dlfcn.h>
++#include <unistd.h>
++#endif
++
++// Spins before a waiting thread sleeps. The OpenMP default is 300000.
++#define CORSIA_SPINCOUNT "10000"
++
++// True when the OpenMP runtime is loaded (the CPU backend was built with it).
++static inline bool corsia_has_openmp() {
++#if defined(__linux__)
++    return dlsym(RTLD_DEFAULT, "omp_get_max_threads") != nullptr;
++#else
++    return false;
++#endif
++}
++
++static inline bool corsia_streaming() {
++    const char * sock = getenv("CORSIA_SOCKET");
++    const char * cool = getenv("CORSIA_COOL");
++    return sock && *sock && !(cool && strcmp(cool, "0") == 0);
++}
++
++// Call first thing with main()'s argv. Returns only if the program carries on as it is.
++static inline void corsia_cool_threads(char ** argv) {
++#if defined(__linux__)
++    if (!corsia_has_openmp() || !corsia_streaming() || getenv("CORSIA_COOL") || getenv("OMP_WAIT_POLICY") || getenv("GOMP_SPINCOUNT")) {
++        return;
++    }
++    setenv("GOMP_SPINCOUNT", CORSIA_SPINCOUNT, 1);
++    setenv("CORSIA_COOL", "1", 1); // marks the second start, so this happens once
++    execv("/proc/self/exe", argv);
++    unsetenv("GOMP_SPINCOUNT"); // could not start again: carry on with the defaults
++#else
++    (void) argv;
++#endif
++}
++
++// What waiting threads do, for the startup line.
++static inline const char * corsia_cool_describe() {
++    static char text[64];
++    const char * policy = getenv("OMP_WAIT_POLICY");
++    const char * spin = getenv("GOMP_SPINCOUNT");
++    if (spin && *spin) {
++        snprintf(text, sizeof(text), "%s times", spin);
++    } else if (policy && strcasecmp(policy, "passive") == 0) {
++        return "not at all";
++    } else {
++        return "the OpenMP default (300000 times)";
++    }
++    return text;
++}
+-- 
+2.53.0
+

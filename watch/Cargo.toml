@@ -1,0 +1,21 @@
+[package]
+name = "corsia-watch"
+version = "0.1.0"
+edition = "2024"
+description = "Live progress terminal for Corsia: test runs and the running daemon"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A crate of its own so Corsia's main build keeps its three dependencies and never
+# compiles or resolves the terminal UI. `corsia watch` runs this binary.
+
+[dependencies]
+notify = "8.2.1"
+ratatui = "0.30.2"
+# preserve_order keeps metrics in the order a run reports them.
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4

@@ -1,0 +1,22 @@
+[package]
+name = "corsia"
+version = "0.1.0"
+edition = "2024"
+description = "Spreads model weights across every drive you have and streams them at the combined speed"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/codewic/corsia"
+keywords = ["llm", "inference", "storage", "io-uring", "moe"]
+categories = ["command-line-utilities", "filesystem"]
+# Not on crates.io until the owner confirms the name and licence.
+publish = false
+
+[dependencies]
+# Pure-Rust FUSE: mounts through fusermount3, needs no libfuse headers.
+fuser = { version = "0.19", default-features = false }
+io-uring = "0.7"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4

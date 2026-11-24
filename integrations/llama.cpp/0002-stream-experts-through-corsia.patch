@@ -1,0 +1,210 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index 657dcdb..99f254a 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "build-info.h"
+ #include "common.h"
++#include "corsia-experts.h"
+ 
+ #include "../src/llama-ext.h"
+ 
+@@ -1762,6 +1763,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.flash_attn_type   = params.flash_attn_type;
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
++    corsia_experts_install(params.model.path, cparams); // expert streaming when CORSIA_SOCKET is set
+     cparams.offload_kqv       = !params.no_kv_offload;
+     cparams.no_perf           = params.no_perf;
+     cparams.op_offload        = !params.no_op_offload;
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+new file mode 100644
+index 0000000..15c41dd
+--- /dev/null
++++ b/common/corsia-experts.h
+@@ -0,0 +1,184 @@
++#pragma once
++
++// Expert streaming through Corsia, for MoE models bigger than RAM.
++//
++// Run the model memory-mapped from Corsia's mount (the default load mode) with
++// CORSIA_SOCKET set. As soon as a layer's router has picked its experts, this asks
++// Corsia, in one request, for exactly those experts' slices of that layer's expert
++// weights. Corsia reads them from all its drives at once and stores them straight into
++// the kernel's page cache for the mounted file, so the expert matmuls that follow find
++// them in memory instead of faulting them in page by page.
++//
++//   corsia serve model.gguf --mount ~/corsia --copy-to /media/usbdisk
++//   CORSIA_SOCKET=/run/user/1000/corsia/model.gguf.sock llama-completion -m ~/corsia/model.gguf ...
++//
++// Nothing happens without CORSIA_SOCKET, or when a program installs its own eval callback.
++
++#include "../src/corsia-client.h"
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "gguf.h"
++#include "log.h"
++#include "llama.h"
++
++#include <sys/stat.h>
++#include <sys/vfs.h>
++
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <vector>
++
++struct corsia_experts {
++    struct tensor {
++        uint64_t offs;   // file offset of expert 0
++        uint64_t stride; // bytes per expert
++        int64_t n_expert;
++    };
++
++    corsia_client * client = nullptr;
++    std::vector<std::vector<tensor>> layers; // per layer: gate, up, down or fused gate_up
++    std::vector<int32_t> ids;
++    std::vector<uint8_t> want;
++    std::vector<corsia_range> ranges;
++    uint64_t requests = 0;
++    uint64_t bytes = 0;
++    bool broken = false;
++
++    ~corsia_experts() {
++        if (client) {
++            corsia_close(client);
++        }
++        if (requests) {
++            LOG_INF("corsia: %llu expert prefetches, %llu MiB put in memory ahead of use\n",
++                (unsigned long long) requests, (unsigned long long) (bytes >> 20));
++        }
++    }
++
++    // Reads where every layer's expert tensors live in the file.
++    bool map_experts(const char * path) {
++        ggml_context * meta = nullptr;
++        gguf_init_params p = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
++        gguf_context * g = gguf_init_from_file(path, p);
++        if (g == nullptr) {
++            return false;
++        }
++        const uint64_t data = gguf_get_data_offset(g);
++        for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
++            const char * name = gguf_get_tensor_name(g, i);
++            int il = -1;
++            char kind[32] = {0};
++            if (std::sscanf(name, "blk.%d.ffn_%31[a-z_]", &il, kind) != 2 || il < 0) {
++                continue;
++            }
++            const std::string k = kind;
++            if (k != "gate_exps" && k != "up_exps" && k != "down_exps" && k != "gate_up_exps") {
++                continue;
++            }
++            const ggml_tensor * t = ggml_get_tensor(meta, name);
++            if (t == nullptr || t->ne[2] < 2 || ggml_nbytes(t) % t->ne[2] != 0) {
++                continue;
++            }
++            if ((size_t) il >= layers.size()) {
++                layers.resize(il + 1);
++            }
++            layers[il].push_back({ data + gguf_get_tensor_offset(g, i), ggml_nbytes(t) / (uint64_t) t->ne[2], t->ne[2] });
++        }
++        gguf_free(g);
++        ggml_free(meta);
++        return !layers.empty();
++    }
++
++    // The router output for layer `il`: I32 [n_expert_used, n_tokens], possibly a view.
++    void prefetch(const ggml_tensor * topk, int il) {
++        if (broken || il < 0 || (size_t) il >= layers.size() || layers[il].empty() || topk->type != GGML_TYPE_I32) {
++            return;
++        }
++        const int64_t n_used = topk->ne[0];
++        const int64_t n_tok = topk->ne[1];
++        const int64_t n_expert = layers[il][0].n_expert;
++        want.assign(n_expert, 0);
++        ids.resize(n_used);
++        for (int64_t r = 0; r < n_tok; r++) {
++            ggml_backend_tensor_get(topk, ids.data(), r * topk->nb[1], n_used * sizeof(int32_t));
++            for (int32_t e : ids) {
++                if (e >= 0 && e < n_expert) {
++                    want[e] = 1;
++                }
++            }
++        }
++        ranges.clear();
++        for (const tensor & t : layers[il]) {
++            for (int64_t e = 0; e < t.n_expert && e < n_expert; e++) {
++                if (want[e] && t.stride <= UINT32_MAX) {
++                    ranges.push_back({ t.offs + e * t.stride, (uint32_t) t.stride, 0 });
++                }
++            }
++        }
++        if (ranges.empty() || ranges.size() > CORSIA_MAX_RANGES) {
++            return;
++        }
++        uint64_t got = 0;
++        if (corsia_prefetch(client, ranges.data(), ranges.size(), &got) != 0) {
++            broken = true;
++            LOG_WRN("corsia: expert prefetch failed (%s); experts load the usual way from now on\n", std::strerror(errno));
++            return;
++        }
++        requests++;
++        bytes += got;
++    }
++
++    static bool eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
++        static const char prefix[] = "ffn_moe_topk-";
++        const bool topk = std::strncmp(t->name, prefix, sizeof(prefix) - 1) == 0;
++        if (ask) {
++            return topk; // see only the router outputs
++        }
++        if (topk) {
++            static_cast<corsia_experts *>(user_data)->prefetch(t, std::atoi(t->name + sizeof(prefix) - 1));
++        }
++        return true; // keep computing
++    }
++};
++
++// Installs the expert prefetch callback when CORSIA_SOCKET is set. Safe to call often.
++inline void corsia_experts_install(const std::string & model_path, llama_context_params & cparams) {
++    static std::unique_ptr<corsia_experts> instance;
++    static bool tried = false;
++    const char * socket = std::getenv("CORSIA_SOCKET");
++    if (socket == nullptr || *socket == '\0' || cparams.cb_eval != nullptr) {
++        return;
++    }
++    if (!tried) {
++        tried = true;
++        auto s = std::make_unique<corsia_experts>();
++        struct stat st = {};
++        struct statfs fs = {};
++        if (stat(model_path.c_str(), &st) != 0 || !s->map_experts(model_path.c_str())) {
++            LOG_WRN("corsia: %s has no expert tensors to stream; not prefetching\n", model_path.c_str());
++            return;
++        }
++        if (statfs(model_path.c_str(), &fs) == 0 && fs.f_type != 0x65735546 /* FUSE */) {
++            LOG_WRN("corsia: %s is not on Corsia's mount; prefetching only helps a model opened from the mount\n", model_path.c_str());
++        }
++        char err[256] = {0};
++        s->client = corsia_connect(socket, 4096 * 4, err, sizeof err);
++        if (s->client == nullptr) {
++            LOG_WRN("corsia: not streaming experts (%s)\n", err);
++            return;
++        }
++        if (corsia_model_bytes(s->client) != (uint64_t) st.st_size) {
++            LOG_WRN("corsia: serves a different file than %s; not prefetching\n", model_path.c_str());
++            return;
++        }
++        LOG_INF("corsia: streaming experts for %zu layers through %s\n", s->layers.size(), socket);
++        instance = std::move(s);
++    }
++    if (instance) {
++        cparams.cb_eval = corsia_experts::eval_cb;
++        cparams.cb_eval_user_data = instance.get();
++    }
++}

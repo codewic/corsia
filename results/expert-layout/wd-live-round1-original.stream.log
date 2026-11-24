@@ -1,0 +1,34 @@
+== Cap 6 GiB, model 11 GiB, 32 tokens
+== llama.cpp: -c 2048 -fa on -ctk q8_0 -ctv q8_0 -b 256 -ub 256
+== stream
+0.00.002.074 I llama_completion: llama backend init
+0.00.006.087 I llama_completion: load the model and apply lora adapter, if any
+0.00.230.307 I corsia: streaming experts for 48 layers through /run/user/1000/corsia/Qwen3-30B-A3B-UD-Q2_K_XL.gguf.sock; guessing ahead off (48 routers, top 8 + 0)
+0.00.230.347 I corsia: 2 compute threads; a waiting thread spins 10000 times before it sleeps
+0.00.999.066 W load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+1.47.045.963 I cmn          init: llama threadpool init, n_threads = 2
+1.47.077.901 I 
+1.47.078.025 I system_info: n_threads = 2 (n_threads_batch = 2) / 4 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+1.47.078.026 I 
+1.47.078.176 I sampler seed: 4137036794
+1.47.078.199 I sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 40, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.800
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+1.47.078.210 I sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist 
+1.47.078.212 I generate: n_ctx = 2048, n_batch = 256, n_predict = 32, n_keep = 0
+1.47.078.213 I 
+Write a short story about a lighthouse keeper. The story should have a beginning, middle, and end. The story should also include at least one character who is a sea creature. The story should be set
+
+3.33.370.333 I common_perf_print:    sampling time =      19.90 ms
+3.33.370.338 I common_perf_print:    samplers time =       6.54 ms /    42 tokens
+3.33.370.345 I common_perf_print:        load time =   57842.85 ms
+3.33.370.351 I common_perf_print: prompt eval time =   57842.42 ms /    10 tokens ( 5784.24 ms per token,     0.17 tokens per second)
+3.33.370.354 I common_perf_print:        eval time =   48427.67 ms /    31 runs   ( 1562.18 ms per token,     0.64 tokens per second)
+3.33.370.358 I common_perf_print:       total time =  106292.45 ms /    41 tokens
+3.33.370.359 I common_perf_print: unaccounted time =       2.46 ms /   0.0 %      (total - sampling - prompt eval - eval) / (total)
+3.33.370.360 I common_perf_print:    graphs reused =         30
+3.33.370.361 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+heat: 67.1 CPU seconds in 217.1 s (34.4 user, 32.6 system)
+heat: package peak 94 C, mean 88 C

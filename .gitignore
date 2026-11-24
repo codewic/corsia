@@ -1,0 +1,10 @@
+# Build output
+/target/
+/watch/target/
+# Generated bundle for the Colab notebook: rebuild it, do not commit it
+/colab/*.tar.gz
+# Models and local scratch never belong in the repository
+*.gguf
+*.safetensors
+/models/
+.env

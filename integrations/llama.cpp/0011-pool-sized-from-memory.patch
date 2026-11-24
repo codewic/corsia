@@ -1,0 +1,232 @@
+From 1190ceb520a43adba1f68683979809a8ddd0f54f Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:07:04 +0000
+Subject: [PATCH] corsia: size the expert pool from memory by default
+
+---
+ CORSIA.md               |   4 +-
+ common/common.cpp       |   3 +-
+ common/corsia-experts.h | 115 +++++++++++++++++++++++++++++++++++++++-
+ common/corsia-pool.h    |   2 +-
+ 4 files changed, 119 insertions(+), 5 deletions(-)
+
+diff --git a/CORSIA.md b/CORSIA.md
+index cf2c9e6..c4d04ad 100644
+--- a/CORSIA.md
++++ b/CORSIA.md
+@@ -20,6 +20,7 @@ upstream llama.cpp.
+ | Complete trace lines | `common/corsia-experts.h` | A trace line is written only when every layer recorded its experts |
+ | Expert pointer table | `ggml/src/ggml-cpu/ggml-cpu.c`, `tiled/tiled.cpp`, `ggml-cpu.cpp` | The expert matmul can take each expert's weights from a pointer table (`ggml_backend_cpu_set_expert_ptrs`), so experts can live outside their tensor |
+ | Expert pool | `common/corsia-pool.h` | Experts live in memory the engine owns, read by Corsia straight from its drives (no page cache, no faults, no reclaim), least recently used evicted, warm-started from a per-model usage profile |
++| Pool sized from memory | `common/corsia-experts.h` | On by default: the pool takes what the memory cap (or the free memory) leaves after the other weights, the KV cache and the program |
+ | Residency-aware routing | `common/corsia-experts.h` | A chosen expert that is not in memory is swapped for a close runner-up that is, before the weights are gathered |
+ | Confidence-based skipping | `common/corsia-experts.h` | Experts under a share of the layer's weight are skipped (off: it moved the output too much at useful thresholds) |
+ | Build script | `scripts/corsia-build.sh` | The release build Corsia uses |
+@@ -33,7 +34,7 @@ upstream llama.cpp.
+ | `CORSIA_PREDICT_EXTRA` | `0` | Guesses beyond the model's own top-k |
+ | `CORSIA_TRACE` | unset | File to record routing traces in. Works without `CORSIA_SOCKET` |
+ | `CORSIA_COOL` | on | `0` keeps the OpenMP runtime's default spinning |
+-| `CORSIA_POOL_MIB` | unset | Size of the expert pool. Fit it to the memory you give the model (3584 under a 6 GiB cap for Qwen3-30B-A3B Q2). Turns guessing ahead off and swapping on |
++| `CORSIA_POOL_MIB` | `auto` | Size of the expert pool in MiB, `auto` to size it from memory, `0` for no pool. `auto` uses the cgroup's memory cap, or the memory free at start less a tenth of the machine (at least 1 GiB) for everything else, then leaves room for the weights that are not experts, the KV cache and 1.1 GiB for the program. The pool turns guessing ahead off and swapping on |
+ | `CORSIA_POOL_PROFILE` | `~/.cache/corsia/<model>.pool-profile` | Where the pool keeps its usage profile |
+ | `CORSIA_SWAP` | on with the pool, else off | Residency-aware routing; `0` turns it off. `CORSIA_SWAP_RATIO` (0.5), `CORSIA_SWAP_MAX` (2), `CORSIA_SWAP_DEPTH` (8) tune it |
+ | `CORSIA_SKIP` | off | Skip experts under this share of the layer's weight; `CORSIA_SKIP_MIN` (4) are always kept |
+@@ -56,6 +57,7 @@ Three things keep it from turning that waiting into heat:
+ 
+ - Expert pool: output identical to the unchanged model (KL divergence 0.000001, same top token 100%), prompt about twice as fast.
+ - Pool + swapping: 22% faster than guessing on the page cache in cool conditions (2.29 against 1.87 tok/s), 38% in hot ones (1.93 against 1.40); swapping costs KL divergence 0.012, same top token 97%.
++- More memory: 10 GiB against 6 GiB gave 3.8 against 2.7 tok/s (41%) and prompts 2.7 times faster; the automatic size picks what was tuned by hand.
+ - Skipping under 0.1 of the weight dropped 40% of experts but moved the output to KL divergence 0.148 (84% same top token): not used.
+ 
+ ## Building
+diff --git a/common/common.cpp b/common/common.cpp
+index 99f254a..7bf96ab 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1763,7 +1763,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.flash_attn_type   = params.flash_attn_type;
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+-    corsia_experts_install(params.model.path, cparams); // expert streaming when CORSIA_SOCKET is set
+     cparams.offload_kqv       = !params.no_kv_offload;
+     cparams.no_perf           = params.no_perf;
+     cparams.op_offload        = !params.no_op_offload;
+@@ -1776,6 +1775,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.moe_cache_size      = params.moe_cache_size;
+     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+ 
++    corsia_experts_install(params.model.path, cparams); // expert streaming when CORSIA_SOCKET is set (last: sizes its pool from the KV cache settings)
++
+     return cparams;
+ }
+ 
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index 12c533b..d9f1d22 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -95,6 +95,8 @@ struct corsia_experts {
+     size_t map_len = 0;
+     float eps = 1e-6f;
+     int n_used = 0;
++    // What the KV cache needs, for sizing the expert pool from memory (from the model's metadata).
++    uint32_t n_block = 0, n_head = 0, n_head_kv = 0, key_len = 0, value_len = 0, n_embd = 0, ctx_train = 0;
+     int extra = 0; // guesses beyond the model's top-k; 97 to 98% hit rate made spares cost more than they saved
+     bool predict_on = true;
+     std::vector<std::vector<int32_t>> guessed; // per layer, guessed from the layer before
+@@ -161,6 +163,96 @@ struct corsia_experts {
+     }
+ 
+     // Reads where every layer's expert tensors live in the file.
++    // The smallest memory limit on this process's cgroup and its parents (cgroup v2), 0 for none.
++    static uint64_t cgroup_limit() {
++        FILE * f = std::fopen("/proc/self/cgroup", "r");
++        if (f == nullptr) return 0;
++        char line[4096];
++        std::string path;
++        while (std::fgets(line, sizeof line, f)) {
++            if (std::strncmp(line, "0::", 3) == 0) {
++                path = line + 3;
++                while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
++            }
++        }
++        std::fclose(f);
++        uint64_t limit = 0;
++        for (;;) {
++            for (const char * file : { "/memory.max", "/memory.high" }) {
++                FILE * m = std::fopen(("/sys/fs/cgroup" + path + file).c_str(), "r");
++                if (m == nullptr) continue;
++                char v[64] = {0};
++                if (std::fgets(v, sizeof v, m) && std::strncmp(v, "max", 3) != 0) {
++                    const uint64_t b = std::strtoull(v, nullptr, 10);
++                    if (b > 0 && (limit == 0 || b < limit)) limit = b;
++                }
++                std::fclose(m);
++            }
++            if (path.empty() || path == "/") break;
++            const size_t slash = path.find_last_of('/');
++            path = slash == 0 || slash == std::string::npos ? "/" : path.substr(0, slash);
++        }
++        return limit;
++    }
++
++    // A line of /proc/meminfo in bytes, 0 when missing.
++    static uint64_t meminfo(const char * key) {
++        FILE * f = std::fopen("/proc/meminfo", "r");
++        if (f == nullptr) return 0;
++        char line[256];
++        uint64_t kib = 0;
++        const size_t n = std::strlen(key);
++        while (std::fgets(line, sizeof line, f)) {
++            if (std::strncmp(line, key, n) == 0 && line[n] == ':') {
++                kib = std::strtoull(line + n + 1, nullptr, 10);
++                break;
++            }
++        }
++        std::fclose(f);
++        return kib << 10;
++    }
++
++    // Pool size from memory: what this process may use (its memory cap, else the memory free
++    // now less a share kept for the rest of the system), less what the model needs outside the
++    // pool (the weights that are not experts, the KV cache, compute buffers, the program and
++    // Corsia itself). Measured by hand before: 3,584 MiB under a 6 GiB cap, 7,680 under 10 GiB.
++    uint64_t auto_pool_bytes(uint64_t model_bytes, const llama_context_params & cparams) const {
++        const uint64_t MiB = 1ull << 20;
++        uint64_t experts = 0;
++        for (const auto & l : layers) {
++            for (const auto & t : l) experts += t.stride * (uint64_t) t.n_expert;
++        }
++        const uint64_t others = model_bytes > experts ? model_bytes - experts : 0;
++        uint64_t kv = 0;
++        const uint32_t heads_kv = n_head_kv ? n_head_kv : n_head;
++        const uint32_t kl = key_len ? key_len : (n_head ? n_embd / n_head : 0);
++        const uint32_t vl = value_len ? value_len : kl;
++        const uint64_t n_ctx = cparams.n_ctx ? cparams.n_ctx : ctx_train;
++        if (n_block && heads_kv && kl) {
++            kv = n_ctx * n_block * (ggml_row_size(cparams.type_k, (int64_t) heads_kv * kl) + ggml_row_size(cparams.type_v, (int64_t) heads_kv * vl));
++        }
++        const uint64_t fixed = 1152 * MiB; // compute buffers, the program, Corsia and room to breathe (gives the hand-measured sizes)
++        const uint64_t rest = others + kv + fixed;
++        const uint64_t cap = cgroup_limit();
++        const uint64_t total = meminfo("MemTotal");
++        const uint64_t avail = meminfo("MemAvailable");
++        const uint64_t keep = std::max<uint64_t>(1024 * MiB, total / 10); // for the rest of the system
++        uint64_t mine = avail > keep ? avail - keep : 0;
++        const char * from = "free memory";
++        if (cap > 0 && (cap < mine || avail == 0)) {
++            mine = cap;
++            from = "the memory cap";
++        }
++        // Not capped at the experts' raw size here: pool slots are padded, and init() already
++        // stops at one slot per expert (capping here left 10% of the experts out on testbox).
++        const uint64_t pool = mine > rest ? mine - rest : 0;
++        LOG_INF("corsia: expert pool sized from %s: %llu MiB, less %llu MiB outside the pool (weights %llu, KV cache %llu, the rest %llu) = %llu MiB%s\n",
++            from, (unsigned long long) (mine / MiB), (unsigned long long) (rest / MiB), (unsigned long long) (others / MiB),
++            (unsigned long long) (kv / MiB), (unsigned long long) (fixed / MiB), (unsigned long long) (pool / MiB),
++            pool >= experts ? " (every expert fits)" : "");
++        return pool;
++    }
++
+     bool map_experts(const char * path) {
+         ggml_context * meta = nullptr;
+         gguf_init_params p = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+@@ -179,6 +271,19 @@ struct corsia_experts {
+                 eps = gguf_get_val_f32(g, k);
+             } else if (ends(".expert_used_count") && gguf_get_kv_type(g, k) == GGUF_TYPE_UINT32) {
+                 n_used = (int) gguf_get_val_u32(g, k);
++            } else if (gguf_get_kv_type(g, k) == GGUF_TYPE_UINT32) {
++                const uint32_t v = gguf_get_val_u32(g, k);
++                if (ends(".block_count")) n_block = v;
++                else if (ends(".attention.head_count")) n_head = v;
++                else if (ends(".attention.head_count_kv")) n_head_kv = v;
++                else if (ends(".attention.key_length")) key_len = v;
++                else if (ends(".attention.value_length")) value_len = v;
++                else if (ends(".embedding_length")) n_embd = v;
++                else if (ends(".context_length")) ctx_train = v;
++            } else if (ends(".attention.head_count_kv") && gguf_get_kv_type(g, k) == GGUF_TYPE_ARRAY
++                       && gguf_get_arr_type(g, k) == GGUF_TYPE_UINT32) {
++                const uint32_t * a = (const uint32_t *) gguf_get_arr_data(g, k); // per layer: take the largest
++                for (size_t j = 0; j < gguf_get_arr_n(g, k); j++) n_head_kv = std::max(n_head_kv, a[j]);
+             }
+         }
+         for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+@@ -714,7 +819,13 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+         }
+         LOG_INF("corsia: streaming experts for %zu layers through %s; guessing ahead %s (%zu routers, top %d + %d)\n",
+             s->layers.size(), socket, s->predict_on ? "on" : "off", with_router, s->n_used, s->extra);
+-        if (const char * pm = std::getenv("CORSIA_POOL_MIB"); pm && std::atoll(pm) > 0) {
++        // The expert pool: on by default, sized from the memory this process may use
++        // (CORSIA_POOL_MIB=auto, the default), a fixed size in MiB, or 0 for off.
++        const char * pm = std::getenv("CORSIA_POOL_MIB");
++        const uint64_t pool_bytes = (pm == nullptr || *pm == '\0' || std::strcmp(pm, "auto") == 0)
++            ? s->auto_pool_bytes((uint64_t) st.st_size, cparams)
++            : (uint64_t) std::max(0LL, std::atoll(pm)) << 20;
++        if (pool_bytes > 0) {
+             std::vector<std::vector<corsia_pool::slice>> slices(s->layers.size());
+             for (size_t il = 0; il < s->layers.size(); il++) {
+                 for (const auto & t : s->layers[il]) {
+@@ -729,7 +840,7 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+                     break;
+                 }
+             }
+-            if (experts > 0 && p->init(socket, (uint64_t) std::atoll(pm) << 20, std::move(slices), experts, model_path)) {
++            if (experts > 0 && p->init(socket, pool_bytes, std::move(slices), experts, model_path)) {
+                 LOG_INF("corsia: expert pool of %lld slots (%.1f MiB each): experts are read straight into it, not through the page cache\n",
+                     (long long) p->n_slots, p->slot_bytes / 1048576.0);
+                 p->map = s->map;
+diff --git a/common/corsia-pool.h b/common/corsia-pool.h
+index 0f3c653..5a818c6 100644
+--- a/common/corsia-pool.h
++++ b/common/corsia-pool.h
+@@ -135,7 +135,7 @@ struct corsia_pool {
+         if (slot_bytes == 0) {
+             return false;
+         }
+-        n_slots = (int64_t) (pool_bytes / slot_bytes);
++        n_slots = std::min((int64_t) (pool_bytes / slot_bytes), (int64_t) layers.size() * n_expert); // no more than every expert
+         if (n_slots < n_expert) {
+             LOG_WRN("corsia: an expert pool of %llu MiB holds %lld experts, fewer than one layer's %lld; not using it\n",
+                 (unsigned long long) (pool_bytes >> 20), (long long) n_slots, (long long) n_expert);
+-- 
+2.53.0
+

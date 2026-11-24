@@ -1,0 +1,15 @@
+Corsia replay: disk model
+Trace: 48 layers × 128 experts, top 8 · llama.cpp model=Qwen3-30B-A3B-UD-Q2_K_XL.gguf · replaying tokens 128..255
+Model: ~/models/gguf/Qwen3-30B-A3B-UD-Q2_K_XL.gguf · 1.67 MiB per expert on average · RAM cache 800 MiB (477 experts, 50% hits)
+Disk: 6.3 ms per seek, 91 MB/s, gaps under 556 KiB read through
+Expert order learned from traces/qwen3-30b-q2-prose.trace (warm-up tokens), 128 tokens · of a token's experts in a layer, 3.55 pairs sit side by side (id order 0.41)
+Copy size: 11.07 GiB for a 11.00 GiB model (pages two slices share are stored twice)
+
+Per token (experts fetched, pieces asked for, reads after merging):
+Layout                                  experts   pieces   reads       MB  seek s  transfer   s/token
+File layout (today)                       191.3    556.2   544.1    345.9    3.43      3.80      7.23
+Expert-major copy, id order               191.3    556.2   185.4    339.8    1.17      3.73      4.90
+Expert-major copy, co-firing order        191.3    556.2   132.6    339.8    0.84      3.73      4.57
+Best: 1.58x faster than the file layout.
+
+The disk model counts reads and bytes; real disks also queue and reorder reads, so treat the ratios as the result and the seconds as a guide.

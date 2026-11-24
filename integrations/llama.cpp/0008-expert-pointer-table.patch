@@ -1,0 +1,132 @@
+From 81af8c5e37e28e2e45043bf876ce79e81895f380 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:31:10 +0000
+Subject: [PATCH] Let the CPU expert matmul take expert pointers from a table
+
+---
+ ggml/src/ggml-cpu/ggml-cpu-impl.h |  6 +++++
+ ggml/src/ggml-cpu/ggml-cpu.c      | 37 ++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cpu/ggml-cpu.cpp    |  5 +++++
+ ggml/src/ggml-cpu/tiled/tiled.cpp |  4 +++-
+ 4 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-impl.h b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+index f8b3637..1a11e82 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-impl.h
++++ b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+@@ -532,6 +532,12 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
+ // TODO: move to ggml-threading
+ void ggml_barrier(struct ggml_threadpool * tp);
+ 
++// Corsia: per-expert weight pointers registered for a MUL_MAT_ID weight tensor, keyed by
++// the tensor's data pointer; NULL when none are registered. An entry that is NULL means
++// "the expert's usual place in the tensor".
++const void * const * ggml_cpu_expert_ptrs(const void * data);
++void ggml_cpu_set_expert_ptrs(const void * data, const void * const * ptrs);
++
+ void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
+ int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 40e93cc..e4727f3 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -582,6 +582,38 @@ struct ggml_state {
+ 
+ static struct ggml_state g_state = {0};
+ 
++// Corsia: experts that live outside their tensor (a pool the engine fills itself). The
++// table is small (one entry per expert weight tensor) and only read once per MUL_MAT_ID.
++#define GGML_CPU_EXPERT_TABLES 1024
++static struct {
++    const void * data;
++    const void * const * ptrs;
++} ggml_cpu_expert_tables[GGML_CPU_EXPERT_TABLES];
++static int ggml_cpu_n_expert_tables = 0;
++
++void ggml_cpu_set_expert_ptrs(const void * data, const void * const * ptrs) {
++    for (int i = 0; i < ggml_cpu_n_expert_tables; i++) {
++        if (ggml_cpu_expert_tables[i].data == data) {
++            ggml_cpu_expert_tables[i].ptrs = ptrs;
++            return;
++        }
++    }
++    if (ptrs != NULL && ggml_cpu_n_expert_tables < GGML_CPU_EXPERT_TABLES) {
++        ggml_cpu_expert_tables[ggml_cpu_n_expert_tables].data = data;
++        ggml_cpu_expert_tables[ggml_cpu_n_expert_tables].ptrs = ptrs;
++        ggml_cpu_n_expert_tables++;
++    }
++}
++
++const void * const * ggml_cpu_expert_ptrs(const void * data) {
++    for (int i = 0; i < ggml_cpu_n_expert_tables; i++) {
++        if (ggml_cpu_expert_tables[i].data == data) {
++            return ggml_cpu_expert_tables[i].ptrs;
++        }
++    }
++    return NULL;
++}
++
+ void ggml_barrier(struct ggml_threadpool * tp) {
+     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
+     if (n_threads == 1) {
+@@ -1688,6 +1720,8 @@ static void ggml_compute_forward_mul_mat_id(
+ 
+     ggml_barrier(params->threadpool);
+ 
++    const void * const * expert_ptrs = ggml_cpu_expert_ptrs(src0->data); // Corsia
++
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+         const int64_t cne1 = matrix_row_counts[cur_a];
+ 
+@@ -1700,7 +1734,8 @@ static void ggml_compute_forward_mul_mat_id(
+             continue;
+         }
+ 
+-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
++        const char * src0_cur = expert_ptrs && expert_ptrs[cur_a] ? (const char *) expert_ptrs[cur_a]
++                                                                   : (const char *) src0->data + cur_a * nb02;
+         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 2978340..35a7bc4 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -6,6 +6,8 @@
+ #include "ggml-impl.h"
+ #include "amx/amx.h"
+ 
++extern "C" void ggml_cpu_set_expert_ptrs(const void * data, const void * const * ptrs); // Corsia, in ggml-cpu.c
++
+ #include <cctype>
+ #include <string>
+ #include <vector>
+@@ -657,6 +659,9 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
+ }
+ 
+ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_cpu_set_expert_ptrs") == 0) {
++        return (void *)ggml_cpu_set_expert_ptrs; // Corsia: experts in an engine-owned pool
++    }
+     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
+         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
+         return (void *)fct;
+diff --git a/ggml/src/ggml-cpu/tiled/tiled.cpp b/ggml/src/ggml-cpu/tiled/tiled.cpp
+index 77e1a99..622b64d 100644
+--- a/ggml/src/ggml-cpu/tiled/tiled.cpp
++++ b/ggml/src/ggml-cpu/tiled/tiled.cpp
+@@ -856,7 +856,9 @@ static void ggml_compute_forward_mul_mat_id_tiled_one_expert(
+     const size_t nbw1 = (src1->type == vec_dot_type) ? nb11 : ggml_row_size(vec_dot_type, ne10);
+     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+ 
+-    const char * src0_cur = (const char *) src0->data + cur_a * nb02;
++    const void * const * expert_ptrs = ggml_cpu_expert_ptrs(src0->data); // Corsia
++    const char * src0_cur = expert_ptrs && expert_ptrs[cur_a] ? (const char *) expert_ptrs[cur_a]
++                                                               : (const char *) src0->data + cur_a * nb02;
+ 
+     // this thread's workspace
+     tiled_ws * ws = (tiled_ws *) (scratch + (size_t) ith * ggml_tiled_ws_size());
+-- 
+2.53.0
+

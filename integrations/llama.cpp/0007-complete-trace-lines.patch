@@ -1,0 +1,32 @@
+From 17224fb95f95b0f601d69bb9370d3da3f2fdb410 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 06:12:36 +0000
+Subject: [PATCH] Write a trace line only when every layer recorded its experts
+
+---
+ common/corsia-experts.h | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index dc7a44f..a5cff43 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -270,6 +270,15 @@ struct corsia_experts {
+         if (il + 1 != (int) layers.size()) {
+             return;
+         }
++        // The prompt pass trims the last layer to the output token alone, so only that
++        // layer sees one token: a line counts only when every layer recorded its experts.
++        const bool complete = std::none_of(trace_tok.begin(), trace_tok.end(), [](const std::vector<int32_t> & t) { return t.empty(); });
++        if (!complete) {
++            for (auto & t : trace_tok) {
++                t.clear();
++            }
++            return;
++        }
+         for (size_t l = 0; l < trace_tok.size(); l++) {
+             if (l) std::fputc(' ', trace);
+             for (size_t i = 0; i < trace_tok[l].size(); i++) {
+-- 
+2.53.0
+

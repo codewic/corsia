@@ -1,0 +1,38 @@
+=== waiting for the machine since 07:54:19 ===
+=== machine free at 09:06:20, running ===
+=== original-1 ===
+Results go to ~/.cache/corsia-build/stream-20261123-090620.log
+this checkout already has the Corsia changes (fork branch or patched earlier)
+== Cap 6 GiB, model 11 GiB, 32 tokens
+== llama.cpp: -c 2048 -fa on -ctk q8_0 -ctv q8_0 -b 256 -ub 256
+== stream
+0.00.230.307 I corsia: streaming experts for 48 layers through /run/user/1000/corsia/Qwen3-30B-A3B-UD-Q2_K_XL.gguf.sock; guessing ahead off (48 routers, top 8 + 0)
+0.00.230.347 I corsia: 2 compute threads; a waiting thread spins 10000 times before it sleeps
+3.33.370.345 I common_perf_print:        load time =   57842.85 ms
+3.33.370.351 I common_perf_print: prompt eval time =   57842.42 ms /    10 tokens ( 5784.24 ms per token,     0.17 tokens per second)
+3.33.370.354 I common_perf_print:        eval time =   48427.67 ms /    31 runs   ( 1562.18 ms per token,     0.64 tokens per second)
+heat: 67.1 CPU seconds in 217.1 s (34.4 user, 32.6 system)
+heat: package peak 94 C, mean 88 C
+Done. Compare the 'eval time ... tokens per second' lines above (full output in ~/.cache/corsia-build/stream-20261123-090620.log).
+original-1: original (file) on sdb: 15.92 GiB in 20210 reads, 0 errors
+=== experts-1 ===
+Results go to ~/.cache/corsia-build/stream-20261123-090958.log
+this checkout already has the Corsia changes (fork branch or patched earlier)
+== Cap 6 GiB, model 11 GiB, 32 tokens
+== llama.cpp: -c 2048 -fa on -ctk q8_0 -ctv q8_0 -b 256 -ub 256
+== stream
+0.00.189.178 I corsia: streaming experts for 48 layers through /run/user/1000/corsia/Qwen3-30B-A3B-UD-Q2_K_XL.gguf.sock; guessing ahead off (48 routers, top 8 + 0)
+0.00.189.200 I corsia: 2 compute threads; a waiting thread spins 10000 times before it sleeps
+6.03.914.484 I common_perf_print:        load time =   75708.19 ms
+6.03.914.489 I common_perf_print: prompt eval time =   75707.82 ms /    10 tokens ( 7570.78 ms per token,     0.13 tokens per second)
+6.03.914.493 I common_perf_print:        eval time =   45969.17 ms /    31 runs   ( 1482.88 ms per token,     0.67 tokens per second)
+6.04.210.393 I corsia: 1536 expert prefetches, 3646 MiB put in memory ahead of use
+heat: 71.5 CPU seconds in 370.2 s (38.2 user, 33.3 system)
+heat: package peak 92 C, mean 88 C
+Done. Compare the 'eval time ... tokens per second' lines above (full output in ~/.cache/corsia-build/stream-20261123-090958.log).
+experts-1: original (file) on sdb: 0.00 GiB in 0 reads, 0 errors
+experts-1: copy (experts) on sdb: 16.52 GiB in 37315 reads, 0 errors
+=== Summary (eval time, generation) ===
+experts-1: Done. Compare the 'eval time ... tokens per second' lines above (full output in ~/.cache/corsia-build/stream-20261123-090958.log).
+original-1: Done. Compare the 'eval time ... tokens per second' lines above (full output in ~/.cache/corsia-build/stream-20261123-090620.log).
+=== exit 0 at 09:16:09 ===
