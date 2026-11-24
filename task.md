@@ -2,6 +2,8 @@
 
 Spec: [SPEC.md](SPEC.md). Update as work lands.
 
+> This is the project's working log, kept in the open: what was tried, on which machine, what it measured, and what did not work. It is long and written as the work happened. For a way in, start with the [README](README.md) and the guides in [docs/](docs/).
+
 ## Phase 1: lanes and bench (done 2026-11-22)
 
 - [x] Rust project, two dependencies (io-uring, libc), builds in about 18 s at `-j 2`
@@ -490,8 +492,8 @@ See SPEC.md section 5: daemon and blind mode, hinted mode, progressive weights, 
 
 ## Owner decisions open
 
-- [ ] Licence (MIT OR Apache-2.0 proposed)
-- [ ] Name confirmed (Corsia; Treccia as an alternative) and trademark check
+- [x] Licence: MIT OR Apache-2.0 (published with the repository on 2026-11-24)
+- [ ] Name: published as Corsia on 2026-11-24; a trademark check is still to do
 - [ ] Management UI as a local web UI served by the daemon (recommended) or a desktop app
 - [ ] Mark and reserved hue when the UI starts
 

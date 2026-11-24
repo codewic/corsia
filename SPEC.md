@@ -78,6 +78,6 @@ The daemon owns the work; the UI is a client of it, so the engine stays headless
 
 ## 7. Open questions
 
-- Licence: MIT OR Apache-2.0 proposed.
-- Name: Corsia (crates.io free on 2026-11-22; 39 GitHub repositories use the word, none in storage). Alternative: Treccia ("braid"). A trademark check is still to do.
+- Licence: settled, MIT OR Apache-2.0 (published 2026-11-24).
+- Name: Corsia (crates.io free on 2026-11-22; 39 GitHub repositories use the word, none in storage). A trademark check is still to do.
 - Auto mode in `corsia bench` picks one writable folder per drive, including removable ones. It might be better to ask before writing to removable drives.
