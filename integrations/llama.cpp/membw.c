@@ -113,16 +113,19 @@ static int hold(const char * keep, size_t gib) {
     for (;;) pause();
 }
 
-static size_t mem_free_mib(void) {
+static size_t meminfo_mib(const char * key) {
     FILE * f = fopen("/proc/meminfo", "r");
-    char line[128];
+    char line[128], fmt[64];
     size_t kb = 0;
+    snprintf(fmt, sizeof fmt, "%s: %%zu kB", key);
     while (f && fgets(line, sizeof line, f)) {
-        if (sscanf(line, "MemFree: %zu kB", &kb) == 1) break;
+        if (sscanf(line, fmt, &kb) == 1) break;
     }
     if (f) fclose(f);
     return kb >> 10;
 }
+
+static size_t mem_free_mib(void) { return meminfo_mib("MemFree"); }
 
 static const double * guard_speed;
 static int cmp_by_speed_desc(const void * a, const void * b) {
@@ -135,17 +138,32 @@ static int cmp_by_speed_desc(const void * a, const void * b) {
 // fast memory. While it holds anything it watches the free memory: under 1 GiB free it lets go
 // of 1 GiB, fastest first, so the load is never squeezed and the hottest data, loaded first,
 // gets the fastest memory. Ends when it holds nothing; SIGTERM ends it at once.
+// It takes at most N GiB and stops taking as soon as less than 3 GiB would be left available:
+// "available" memory that is file cache can be slow to give up, and a guard that insists on
+// it squeezes the machine it is meant to help (seen once: 272 MiB free, a load 15 times slower).
 static int guard(size_t gib) {
-    const size_t chunk = 64ull << 20, n = gib * (1ull << 30) / chunk;
+    const size_t chunk = 64ull << 20;
+    size_t n = gib * (1ull << 30) / chunk;
     uint8_t ** bufs = calloc(n, sizeof *bufs);
     double * speed = calloc(n, sizeof *speed), * sorted = calloc(n, sizeof *sorted);
     size_t * held = calloc(n, sizeof *held);
     if (n < 10) return 1;
+    const char * thp_env = getenv("MEMBW_THP");
+    const int thp = thp_env ? atoi(thp_env) : 1;
     for (size_t i = 0; i < n; i++) {
+        if (i % 4 == 0 && meminfo_mib("MemAvailable") < 3072) {
+            n = i;
+            break;
+        }
         bufs[i] = mmap(NULL, chunk, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (bufs[i] == MAP_FAILED) return 1;
-        madvise(bufs[i], chunk, MADV_HUGEPAGE);
+        if (thp) madvise(bufs[i], chunk, MADV_HUGEPAGE);
         memset(bufs[i], 1, chunk);
+    }
+    if (n < 10) {
+        for (size_t i = 0; i < n; i++) munmap(bufs[i], chunk);
+        printf("guard: too little memory to steer, holding nothing\n");
+        return 0;
     }
     for (size_t i = 0; i < n; i++) sorted[i] = speed[i] = run(bufs[i], chunk, 4);
     qsort(sorted, n, sizeof *sorted, cmp_d);

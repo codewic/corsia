@@ -1,0 +1,49 @@
+From 4fa5a97a84bffd85d23ea4c6b75028b059c72bdd Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:31:06 +0000
+Subject: [PATCH] corsia: two-stage output layer on by default with AVX2
+
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 346275f..e9f3dc3 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1293,7 +1293,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     }
+ }
+ 
+-// Corsia: two-stage output layer (CORSIA_HEAD_PREVIEW=N, 0 or unset: off).
++// Corsia: two-stage output layer. On by default on AVX2 processors with 8,192 rows scored
++// exactly (CORSIA_HEAD_PREVIEW=N sets the rows, 0 turns it off); elsewhere it is off unless
++// asked for, because the first pass has no fast kernel there.
+ //
+ // Every decoded token scores the whole vocabulary: 311 M weights in Qwen3-30B-A3B, a tenth of
+ // what a token reads. Q6_K keeps each weight's low 4 bits and high 2 bits in separate arrays,
+@@ -1303,7 +1305,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+ // scores the N best previewed rows exactly; the other rows keep their preview value.
+ // The high bits are copied once into an array of their own: read in place they sit between
+ // the low bits, the prefetcher pulls those through memory too, and the first pass then costs
+-// as much as the whole matrix (measured: 16.4 ms either way on a memory-bound desktop).
++// as much as the whole matrix (measured: 16.4 ms either way on a memory-bound desktop; from
++// their own array 7.4 to 7.9 ms, and decode 9.6 to 10.2 tok/s against 8.2 to 8.8).
+ // One output compute at a time is assumed (the threshold is shared between the threads).
+ static float corsia_head_thr;
+ 
+@@ -1375,7 +1378,11 @@ static bool corsia_head_preview(const struct ggml_compute_params * params, struc
+     static int keep = -1;
+     if (keep < 0) {
+         const char * e = getenv("CORSIA_HEAD_PREVIEW");
++#if defined(__AVX2__)
++        keep = e ? atoi(e) : 8192;
++#else
+         keep = e ? atoi(e) : 0;
++#endif
+     }
+     const struct ggml_tensor * w = dst->src[0];
+     const struct ggml_tensor * x = dst->src[1];
+-- 
+2.53.0
+

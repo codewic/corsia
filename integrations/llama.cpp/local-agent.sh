@@ -18,6 +18,8 @@
 #   DRAFTS=1          free n-gram drafts (on: +28% on copy-heavy answers at 10 GiB, nothing lost
 #                     on fresh writing); 0 turns them off
 #   PROJECT_DRAFTS=0  1 also drafts from the project's files (corsia agent --corpus), experimental
+#   THREADS=N         compute threads (default: llama.cpp's own choice, one per physical core;
+#                     on a virtual machine try the number of real cores behind it)
 #   THINK=0           the model answers without thinking (a coding task: 118 s against 25+ minutes,
 #                     tests passing both ways); THINK=1 lets it think
 # Watch it with: corsia-watch --url 127.0.0.1:7715 --agent 127.0.0.1:PORT
@@ -47,6 +49,7 @@ UNIT=corsia-local
 DRAFTS="${DRAFTS:-1}"
 PROJECT_DRAFTS="${PROJECT_DRAFTS:-0}"
 THINK="${THINK:-0}"
+THREADS="${THREADS:-}"
 CORPUS="$HOME/.cache/corsia/corpus/current.tok"
 
 die() { echo "local-agent: $*" >&2; exit 1; }
@@ -176,7 +179,7 @@ case "${1:-status}" in
     fi
     # the fork's own switches (CORSIA_...), when set by hand for a test, reach llama-server
     EXTRA=(CORSIA_LOCAL=1)
-    for v in CORSIA_COOL CORSIA_POLL_US CORSIA_BARRIER_SPIN CORSIA_ATTN_SKIP CORSIA_ATTN_STATS CORSIA_OP_PROFILE CORSIA_FIRST CORSIA_GQA_TILED; do
+    for v in CORSIA_COOL CORSIA_OP_PROFILE CORSIA_FIRST CORSIA_GQA_TILED CORSIA_Q8_SCORES CORSIA_HEAD_PREVIEW CORSIA_KV_FIRST; do
       if [ -n "${!v:-}" ]; then EXTRA+=("$v=${!v}"); fi
     done
     # a mount left behind by a killed run answers "Transport endpoint is not connected":
@@ -204,7 +207,12 @@ case "${1:-status}" in
           done
           kill $gp 2>/dev/null
         '
-      for _ in $(seq 120); do grep -q "^guard:" "$STATE/guard.log" 2>/dev/null && break; sleep 1; done
+      for _ in $(seq 300); do grep -q "^guard:" "$STATE/guard.log" 2>/dev/null && break; sleep 1; done
+      if ! grep -q "^guard:" "$STATE/guard.log" 2>/dev/null; then
+        # still measuring after 5 minutes: never load beside a guard that holds the memory
+        systemctl --user stop "$UNIT-guard" 2>/dev/null || true
+        echo "The memory guard took too long to measure and was stopped: loading without it."
+      fi
       if grep -q "^guard: holding" "$STATE/guard.log" 2>/dev/null; then
         GUARD_MIB="$(sed -n 's/^guard: holding \([0-9.]*\) GiB.*/\1/p' "$STATE/guard.log" | awk '{ print int($1 * 1024) }')"
         TIERS=4
@@ -216,7 +224,7 @@ case "${1:-status}" in
       env MODEL="$MODEL" MNT="$MNT" STATE="$STATE" KV="$KV" CTX="$CTX" PORT="$PORT" DAEMON_PORT="$DAEMON_PORT" \
           LLAMA_PORT="$LLAMA_PORT" CORSIA_BIN="$CORSIA_BIN" LLAMA_SERVER="$LLAMA_SERVER" \
           DRAFTS="$DRAFTS" PROJECT_DRAFTS="$PROJECT_DRAFTS" CORPUS="$CORPUS" THINK="$THINK" \
-          CORSIA_GUARD_MIB="$GUARD_MIB" CORSIA_WARM_TIERS="$TIERS" "${EXTRA[@]}" \
+          CORSIA_GUARD_MIB="$GUARD_MIB" CORSIA_WARM_TIERS="$TIERS" THREADS="$THREADS" "${EXTRA[@]}" \
       bash -c '
         rm -f "$STATE/serve.log"
         "$CORSIA_BIN" serve "$MODEL" --mount "$MNT" --port "$DAEMON_PORT" --cache-mib 16 > "$STATE/serve.log" 2>&1 &
@@ -227,7 +235,8 @@ case "${1:-status}" in
         corpus_env=""; corpus_arg=(--corpus off)
         if [ "$PROJECT_DRAFTS" = 1 ]; then corpus_env="$CORPUS"; corpus_arg=(--corpus "$CORPUS"); fi
         think_arg=(--think off); [ "$THINK" = 1 ] && think_arg=(--think on)
-        CORSIA_SOCKET="$sock" CORSIA_DRAFT_CORPUS="$corpus_env" "$LLAMA_SERVER" -m "$MNT/$(basename "$MODEL")" --alias local "${spec[@]}" \
+        threads_arg=(); [ -n "$THREADS" ] && threads_arg=(-t "$THREADS")
+        CORSIA_SOCKET="$sock" CORSIA_DRAFT_CORPUS="$corpus_env" "$LLAMA_SERVER" -m "$MNT/$(basename "$MODEL")" --alias local "${spec[@]}" "${threads_arg[@]}" \
           -c "$CTX" -np 2 --kv-unified -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 -cram 0 \
           --slot-save-path "$KV" --jinja --no-warmup --port "$LLAMA_PORT" > "$STATE/llama-server.log" 2>&1 &
         until curl -sf "http://127.0.0.1:$LLAMA_PORT/health" >/dev/null; do sleep 2; done
