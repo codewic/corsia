@@ -670,3 +670,149 @@ Tried and dropped, all measured:
 - Power limits: PL1 is 35 W, already the firmware maximum. The clock holds 2.9 GHz up to 76 C; it throttles above about 90 C, which long runs reach (93 C seen).
 
 Free n-gram drafts at 10 GiB with the tuned model (llama-server, 256 tokens, temperature 0): copy-and-edit request 2.77 tok/s without, **3.55 with `--spec-type ngram-simple`** (defaults N=12 M=48, 227 of 227 accepted, +28%), 2.80 with N=8 M=16 (87%); fresh writing 3.76 without, 4.06 with the defaults (no drafts made), 3.56 with N=8 M=16 (6% accepted). Under the 6 GiB cap drafts lost on this machine (every verify pass pulled experts off the SSD); with 99% of experts in the pool they win. `local-agent.sh` now runs with drafts on (DRAFTS=0 turns them off); project drafts stay opt-in (PROJECT_DRAFTS=1).
+
+### Drafts that earn their length, grouped decode attention (2026-11-24, fork 82f25d7 and c9d094f, patches 0014 and 0015)
+
+Fixed 48-token n-gram drafts collapsed in a real agent session on the dev box: 9 and 17% of drafted tokens accepted in thinking text, one step at 0.89 tok/s, the session 2,347 s against 900 without drafts. Drafts now start at 8 tokens, double after a fully accepted one (up to 48) and drop to one more than what was accepted after a rejection (`CORSIA_DRAFT_ADAPT=0` keeps the fixed size). On testbox's agent session: 57 to 64% accepted, 4 to 8 tok/s, no collapse. A clean benchmark on the dev box is still to do (the first try ran beside another session's Rust build).
+
+Agent sessions slow down as the conversation grows (testbox: 7.8 tok/s at step 2, 4.2 at step 5, about 6,000 tokens of context): attention. With a q8_0 cache, ggml's CPU decode takes the plain per-head loop (the split path needs an f32/f16 cache, the tiled one several query tokens), so each KV head is read and its V rows converted once per query head: 8 times in Qwen3-30B-A3B. The grouped path walks each KV head once for all its query heads, with each head's operations unchanged, so the output is identical (Qwen3-0.6B, 1,594-token prompt, 200 tokens at temperature 0: same 825 bytes; 6.24 against 5.34 tok/s, +17%, with only 2 query heads per KV head). Kernel benchmark (q8_0 cache, 12 query heads per KV head, dev box, heat between 69 and 95 C): 4k context 4.1 to 6.2 ms against 6.3; 16k 4.7 to 5.9 against 9.6 to 10.4; 32k 6.4 to 9.5 against 12.8. Still to measure: Qwen3-30B decode at long context on a quiet machine.
+
+Also measured: f16, llama.cpp's default KV cache type, is 4 to 6 times slower for attention than q8_0 on CPUs without F16C (this dev box): Corsia's scripts use q8_0. Prompt reading on the dev box runs near 9% of the cores' int8 peak; ggml's AVX-only tiled kernel reuses each unpacked weight slice over 4 tokens; a Q2_K pre-scaled tile (2-bit value times 4-bit scale fits a byte) would save about one operation in six. Not built yet; measure the expert share of prompt time first.
+
+Lessons from the noisy day: the dev box reaches 94 C and throttles thousands of times in long runs, and the Claude desktop app takes half a core during long sessions; long benchmarks belong on testbox, and nothing else may run beside a timing test.
+
+### Where the time goes, and prompt attention fixed (2026-11-24, fork 53913a8 to aa9e479, patches 0016 to 0018)
+
+**Op timer** (`CORSIA_OP_PROFILE=1`, patch 0017): the main thread times each graph node up to the barrier after it and prints the totals per op and weight at exit. testbox, Qwen3-30B-A3B Q2 (tuned copy), 4 threads, q8_0 cache, llama-bench:
+- Prompt (512 tokens, 33.5 tok/s): flash attention **23.6%**, down experts 19.9, gate experts 14.9, up experts 14.7, attention output 8.8, attention q 8.7, everything else under 2% each. By arithmetic attention is about 5% of the work at 512 tokens, so it ran 4 to 5 times less efficiently than the matmuls, and it grows with the square of the context.
+- Decode (64 tokens, 10.2 tok/s): down experts 19.3%, **output layer 15.2%** (14.7 ms a token for the 151,936 x 2048 Q6_K vocabulary), attention output 14.8, up experts 13.7, attention q 13.6, gate experts 13.2, router 2.9, attention 1.1.
+
+**Tiled prompt attention over a quantized cache** (patch 0018): with a q8_0 cache, prompt attention took ggml's per-row path, where each query row walks the whole cache alone and converts each V row again (512 times for a 512-token batch). The tiled path, which converts each 64-row K and V tile to f32 once and multiplies it against 64 query rows, only took f16 and f32 caches; it now takes any cache type with a row converter. `CORSIA_FA_TILED_QUANT=0` keeps the old path.
+
+| testbox, 30B, llama-bench, two rounds each | Old path | Tiled |
+| --- | --- | --- |
+| 512-token prompt | 33.5, 33.6 | **40.6, 41.2 tok/s (+22%)** |
+| 2,048-token prompt | 20.0, 19.9 | **35.8, 36.0 (+80%)** |
+| 512 tokens after 4,096 of context | 7.0, 6.9 | **21.3, 21.5 (3.1x)** |
+| dev box, Qwen3-0.6B, 2 threads: 512 after 2,048 | 5.15, 5.22 | **16.8, 16.6 (3.2x)** |
+
+Quality against an f16 cache (llama-perplexity, 3 chunks of 2,048 tokens of llama.cpp C++): old q8_0 path mean KL divergence 0.00293, maximum 0.736, same top token 98.57%; tiled 0.00280, maximum 0.355, 98.89%. Perplexity 2.4158 and 2.4176 against 2.4126 (±0.10). The tiled path works in f32 instead of rounding queries to q8_0, so it sits a little closer to the reference.
+
+**Built without OpenMP** (patch 0016, `scripts/corsia-build.sh`, `OPENMP=ON` for the old build): testbox decoded 15 to 23% faster with ggml's thread pool; on the dev box the race (two rounds each, alternating) gave 0.48 against 0.46 tok/s, same direction. `local-agent.sh` uses `build-noomp` when it exists.
+
+That dev box race also found the real limit of the day: a browser (5 GB), an editor (2.5) and two assistant apps (3.3) left 3.9 GB available, so the auto pool, which takes the smaller of the cap and free memory less a reserve, came out at 0 MiB and every expert streamed from the SSD (0.46 tok/s against 4.1). The sizer was right not to take the cap, which would have pushed the model's own pages out. On a laptop people also use, free memory matters as much as the cap.
+
+Next levers seen in the profile: the output layer (15% of decode; a smaller format or a cheaper first pass over the vocabulary), and the attention projections (q and output, 28% of decode together).
+
+### Long-context attention: decode, draft checks, short tool results (2026-11-24, fork 05e7b7a to e73c867, patches 0019 to 0021)
+
+Grouped decode attention on Qwen3-30B-A3B (testbox, llama-bench, 4 threads, q8_0 cache): after 8,192 tokens of context, single-token decode **4.28 and 4.29 tok/s against 2.17 and 2.18** for ggml's per-head loop (1.97x). Decode-path KL divergence against an f16 cache (llama-perplexity with a batch of 1, so every token takes the single-token kernel): the grouped loop and the per-head loop gave the same numbers to every digit (KL 0.002509, perplexity 1.909097), as designed.
+
+Op timer at that depth (tags "1" for single-token nodes): attention is 116 ms of a roughly 208 ms token (56%); in the 8,192-token prefill, tiled attention is still 50% of prefill time, at about 31% of the cores' f32 peak.
+
+Tried for decode, kept opt-in or dropped:
+- Blocked softmax (64 rows, one vectorised softmax and rescale per head, V rows as one small matrix product; `CORSIA_GQA_BLOCK=1`, patch 0019): 4.85 and 4.86 against 4.63 and 4.60 tok/s (+5%). KL 0.0038 ± 0.0012 against 0.0025 ± 0.0006 on 1,024 tokens, and maximum KL 0.53 against 0.24 at one position: within noise on the mean but not a clean win, so it stays opt-in.
+- Scoring all 8 heads with one f32 matrix product over a converted, transposed K block: 4.34 and 4.30 against 4.72 and 4.70: slower (the transpose writes at a 256-byte stride and the generic product handles 8 rows as 6 plus 2). Reverted. A dedicated 8-row by 8-head kernel with a transposed reduction is still possible.
+
+**Short batches** (patch 0021): the tiled path needs 64 query tokens and grouped decode took exactly one, so every batch of 2 to 63 tokens (each n-gram draft check, each short tool result or message) took the per-row loop, which reads the whole cache once per query head and token (at 8k context four KV heads are 8.8 MB, past testbox's 8 MB L3). Grouped attention now takes those batches, each KV head read once for its 8 heads and all the tokens, each token with its own mask row; with more threads than KV heads the tokens are split between threads. Output identical (Qwen3-0.6B, batches of 16: the same KL and perplexity to every digit as the old path against its own saved output).
+
+| testbox, 30B, after 8,192 tokens | Old path | Grouped |
+| --- | --- | --- |
+| 16-token batch | 3.11, 3.18 | **8.01, 7.94 tok/s (2.5x)** |
+| 48-token batch | 3.25, 3.21 | **8.18, 8.20 tok/s (2.5x)** |
+
+The old numbers explain the draft losses in long agent sessions: checking a batch of drafts at depth ran at 3.1 tok/s, slower than plain decode (4.7), so every draft check past a few thousand tokens cost more than it could earn. Next lever here: batches of 8 or more tokens give 64 to 504 (token, head) rows per KV head, enough for the tiled matrix product (each K and V tile converted once for every head and token of the group).
+
+### Tiled grouped attention for short batches (2026-11-24, fork 225c529)
+
+Batches whose KV group has 64 or more (token, head) rows (8 or more tokens in Qwen3-30B-A3B) now take a tiled product: each 64-row K and V tile is converted once and multiplied against every row of the group (`CORSIA_GQA_TILED=0` keeps the row loop). testbox, 30B, after 8,192 tokens, two rounds each: 8-token batch 12.0 against 7.0 tok/s, 16-token 14.6 against 7.9, 48-token 16.9 against 8.1 (the per-row path this morning: 3.1 to 3.2). Quality on Qwen3-0.6B against an f16 cache, batches of 48: KL 0.00088 against 0.00108 for the row loop, same top token 99.80% against 99.61%. The 30B KL check was cut short by an agent session and is still to run.
+
+Real agent session on testbox with all of it (Coder Q4_K_M, thinking off, 24 GiB cap): the bug fixed in 142 s, tests passing. The step that read 541 new tokens took 17.7 s (30.6 tok/s) against 41.6 s (13.0 tok/s) in the same session the day before.
+
+### Cold start: the experts were read twice (2026-11-24, fork eff76cc)
+
+A cold start of the Coder Q4_K_M model on testbox (spinning disk, 24 GiB cap) took about 26 minutes and Corsia served 36.8 GB for an 18.6 GB file: the pool read the experts straight from the drive, then llama.cpp's loader mapped the whole file with MAP_POPULATE and pulled every byte through the mount again. With `CORSIA_SOCKET` set the loader now maps the expert tensors as lazy ranges, so only the other weights (about 1 GB) are prefetched (`CORSIA_PREFETCH_ALL=1` keeps the old behaviour). Same cold start: **484 s, 17.5 GB served**, the first 64-token answer 12.6 s later. All of the 484 s is now the pool warming at the disk's 36 MB/s.
+
+### Uneven memory: the half-speed part (2026-11-24, `integrations/llama.cpp/membw.c`)
+
+A read-bandwidth probe (4 threads, 64 MiB chunks, no root) shows testbox's memory has two speeds: of 29 to 31 GiB measured, about 13 GiB reads at 14 to 16 GB/s and about 8 to 10 GiB at 26 to 30 GB/s, the rest mixed. It has 40 GB (a 32 GB and an 8 GB module): only the matched 16 GB runs dual-channel. Huge pages change nothing for streaming (27.3 against 26.9 GB/s). The dev box is even (about 17 GB/s everywhere, ratio 1.2) and uses about 5 GB/s of it while decoding: its limit is arithmetic, not memory.
+
+Decode depends on which part the weights sit in (llama-bench, Qwen3-30B-A3B tuned copy, 4 threads; the probe holds one kind of memory so the model's page cache lands in the other):
+
+| testbox | Prompt (512) | Decode (64) |
+| --- | --- | --- |
+| Model in the fast memory | 41.9 tok/s | **11.00 tok/s** |
+| Model in the slow memory | 42.0 tok/s | 9.23 tok/s |
+| Left to chance (the morning's runs) | 40.6 to 41.2 | about 10.2 |
+
+Nothing else was capped: turbo on, 3.7 to 3.9 GHz, no thermal throttling counted, the power limit at the chip's rated 65 W.
+
+Wired in: `membw guard N` takes the free memory, gives the fast chunks back and holds the slow ones, letting go 1 GiB at a time (fastest first) when free memory drops under 1 GiB. `local-agent.sh start` runs it when setup measured uneven memory (`GUARD=0` turns it off) and tells the pool sizer what it holds (`CORSIA_GUARD_MIB`). The fork reads the weights every token uses before the pool fills (`CORSIA_FIRST=0` turns it off) and warms the pool in four tiers of use (`CORSIA_WARM_TIERS`), so the fast memory goes to what is read most.
+
+### Setup for any machine (2026-11-24, `local-agent.sh setup`)
+
+One step per machine and model: reports the processor's instruction sets, cores, memory and the model's drive; builds corsia and the fork when missing (`TESTS=ON scripts/corsia-build.sh` for the tuner's programs); writes the per-CPU copy of the model (`TUNE=0` skips); measures the memory map; saves `~/.config/corsia/machine.env`. `start` now picks the cap itself (what the model needs, or what is free less a tenth of the memory, at least 2 GiB) and says so when that is less than the model needs: the hard-coded 10 GiB default gave a pool of 0 MiB on a morning when other programs held 12 GB.
+
+Tried and dropped today: skipping low-weight experts again (already failed the gate on 2026-11-23: KL 0.148 at a 0.1 threshold, and a skipped slot still runs its matmul).
+
+### Table-lookup kernel for 2-bit experts: prototyped, dropped (2026-11-24, dev box)
+
+The dev box is arithmetic-bound (5 GB/s of weights against 17 GB/s of memory), so a cheaper 2-bit kernel was tried standalone (`~/.cache/corsia-build/lutq2.c`, linked against the fork's ggml): rows in groups of 16, each pair of 2-bit weights a 4-bit index into a table of the 16 possible partial sums of the input (built once per input vector, shared by a layer's 16 expert matrices), `pshufb` looking 16 rows up at once, entries split into low 6 bits and a signed high part so the result equals ggml's own Q2_K kernel (checked: largest difference 0.00004 on outputs up to 158). Same 2.75 bits per weight. Single thread, 768 x 2048: 0.073 against 0.092 ns per weight with the weights in the third-level cache (1.26x), 0.095 against 0.099 streaming 64 MiB from memory (1.04x). Sandy Bridge has two ports for integer vector work and both kernels fill them; the estimate of 2x counted four operations a cycle. Not worth a new weight layout. A lossy variant (8-bit tables, half the lookups) was not tried.
+
+What is left on the dev box is fewer weights per token (drafts; the output layer's 311 M of the 3,030 M weights a token reads) and heat (cool starts measured about 10% faster than starts at 92 C).
+
+### Worker wake-ups: a false lead (2026-11-24, dev box and testbox)
+
+The dev box's op timer showed 69 us per ADD and 408 us per ARGSORT, and a first pair of runs gave 1.28 and 1.42 tok/s with cool waiting against 2.35 and 2.82 with `CORSIA_COOL=0`. That looked like the cost of putting workers to sleep between the roughly 144 groups of nodes a token's graph is split into by the eval callback. Two changes were written for it (a timed 200 us poll before a worker sleeps; a barrier that naps after a short spin) and then tested properly, five alternating arms on each machine:
+
+| Dev box, 10 GiB cap, auto pool | Pool | Read from the SSD | tok/s |
+| --- | --- | --- | --- |
+| Sleep at once (first arm) | 3,978 MiB | 24.3 GB | 1.79, 2.74 |
+| 200 us poll and nap | 4,628 MiB | 17.3 GB | 3.34, 3.54 |
+| `CORSIA_COOL=0` | 4,729 MiB | 15.6 GB | 3.47, 3.13 |
+| 200 us poll and nap | 4,658 MiB | 18.4 GB | 2.98, 3.07 |
+| Sleep at once | 4,750 MiB | 17.5 GB | 3.35, 3.64 |
+
+With equal pools the old behaviour is as fast as the new. The slow arm was the first one both times: free memory was lower then, so the auto pool was smaller and more experts came from the drive, and the slow nodes in the profile were other programs taking the two cores. On testbox (in use by its owner at the time) the two changes together were slower: 9.65, 9.30, 9.86 against 10.33, 10.63, 10.86 tok/s. Both changes were reverted. Lessons: fix the pool size by hand when comparing on a machine whose free memory moves, and never trust a first arm.
+
+Two bugs found on the way and fixed: `CORSIA_COOL=0` also turned weight repacking back on, because the streaming check read the same variable (6.7 GB of anonymous memory, the service killed at its 16 GiB cap; fork acb2a9a), and `local-agent.sh start` could not recover from the stale mount a killed run leaves behind (it now always unmounts first).
+
+### Guard from an unlucky start; a low-rank output preview does not work (2026-11-24, testbox)
+
+Service decode (Qwen3-30B-A3B tuned copy, 16 GiB cap, three 128-token requests) from the same unlucky state, slow memory freed last: 9.70, 9.91, 9.83 tok/s without the guard, **10.83, 11.28, 11.14 with it**. Back-to-back starts reach 11.3 to 12.3 either way, because a start inherits the memory the last one freed.
+
+Two-stage output layer, checked offline before writing any kernel (`~/.cache/corsia-build/headprev.c`: the output matrix dequantized, its top 512 singular directions by orthogonal iteration, real hidden states from `llama-embedding --pooling none` over 1,627 tokens of C++): the matrix is not low-rank. The top 64, 128, 256 and 512 directions hold 15, 20, 29 and 43% of its energy, and the exact best token (19.5 above the mean logit, spread 2.4) ranks at a median of 20,025 in a 256-direction preview and 7,451 at 512; keeping 16,384 rows still misses it in 843 and 703 of 1,627 positions. A preview by projection is out for this model. Not tried: a low-precision copy of the whole matrix as the preview (2 bits, about 80 MB against 243 MB a token), which keeps every direction.
+
+The decode thread-count test (2, 3 and 4 threads) did not run: its wait loop matched its own command line.
+
+### Sparse V accumulation in decode attention: measured, dropped (2026-11-24, testbox)
+
+Idea: at long context, score every cached row first, then do the V work (convert the row, an exponential and a 128-value weighted add per head) only for rows within T of each query's best score. Measured on real text (7,004 tokens of C++ as the prompt, 96 tokens written, Qwen3-30B-A3B, 4 threads, q8_0 cache), with counters on:
+
+| Threshold | Pairs kept | V rows needed | Decode |
+| --- | --- | --- | --- |
+| Row loop as it is | all | all | 4.86 tok/s |
+| Two passes, nothing skipped | 100% | 100% | 4.53 |
+| 17 (under what a float can add) | 86.5% | 99.0% | 4.27 |
+| 12 | 42.8% | 81.9% | 4.41 |
+| 8 | 7.7% | 27.1% | 5.04 |
+
+Attention here is not sparse on the scale that matters: 86.7% of (row, head) pairs sit within 17 of the best score, so the safe threshold skips little, and one V row serves 8 heads, so nearly every row is still needed. Even dropping 92% of the V work gains 4%: the V work is the small part, and scoring every cached row against 8 heads (plus streaming the cache) is the cost. Code removed. What would help at depth is a cheaper K scoring kernel, which the one-product attempt earlier today did not deliver.
+
+### Two-stage output layer and shared K scoring (2026-11-24, testbox; fork f28ca04 and working tree)
+
+**High-bits preview of the output layer** (`CORSIA_HEAD_PREVIEW=N`, opt-in, in the fork's working tree, not committed). Q6_K stores each weight's low 4 bits and high 2 bits in separate arrays. A first pass over the high bits alone (the low bits taken as their middle value) ranks the vocabulary; the N best rows are then scored exactly and the others keep their preview value. Checked offline first (`headhi.c`, 1,627 real hidden states): the exact best token never ranked below 133 in the preview, the exact top 5 never below 467, the top 20 never below 1,607. In the model (llama-perplexity, batches of one token, 3 chunks of 1,024, against the exact layer):
+
+| Rows scored exactly | Mean KL | Maximum KL | Same top token |
+| --- | --- | --- | --- |
+| 1,024 | 0.000428 | 0.0194 | 100% |
+| 4,096 | 0.000032 | 0.0027 | 100% |
+| 16,384 | 0.000002 | 0.0004 | 100% |
+
+Speed is not there yet. Reading the high bits in place, the first pass cost as much as the whole matrix (16.4 ms a call either way; 17.1 to 17.6 ms with 4,096 rows rescored, 19.9 with 16,384): the output layer runs at memory speed on this machine (243 MB in 16.3 ms is 15 GB/s) and the prefetcher pulls the skipped low bits through memory anyway. A version that copies the high bits once into their own array (82 of every 210 bytes, about 100 MB) is written and was queued for timing when testbox went offline.
+
+**One K row scored for all its query heads** (fork f28ca04, `CORSIA_Q8_SCORES=0` turns it off; AVX2 with FMA only): in the grouped decode loop each K row's blocks are loaded, made absolute and their scales converted once instead of once per query head, with ggml_vec_dot_q8_0_q8_0's arithmetic in the same order. Same text at temperature 0 over 128 tokens after a 7,004-token prompt (twice). Decode there: 4.90 against 4.56 tok/s, then 4.41 against 4.38 (the machine was in use: between nothing and +7%). The KL check against the per-query calls was cut off when testbox went offline.
+
+Reading these with the sparse test: at about 7,000 tokens of context roughly half of attention's time is neither scoring nor V arithmetic but streaming the KV cache (about 365 MB a token), which is allocated after the weights have taken the fast memory. Next idea: hold fast memory for the KV cache during the load (reserve it after the hot weights, release it just before the context is created).
+
+**Waiting for testbox (it went offline at 17:56 on 2026-11-24, mid-run):** in the fork's working tree, built on the dev box and not committed: the output preview with its own high-bits array (`ggml-cpu.c`; timing script `head2-sq.sh` was queued on testbox), and a hold for the KV cache (`corsia-experts.h`, `CORSIA_KV_FIRST=0` turns it off: the cache's size is taken right after the hot weights and given back when the pool is warm, so with the guard the cache lands in fast memory; never run). Still owed: the KL check of shared K scoring, the 30B KL check of tiled grouped attention for short batches (on by default since 225c529), and decode with 2, 3 and 4 threads.
