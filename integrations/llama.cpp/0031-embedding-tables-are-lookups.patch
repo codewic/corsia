@@ -1,0 +1,78 @@
+From 27ac6c6b1b627b9e03d87f6d0022bd9ff4b5692f Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:08:14 +0000
+Subject: [PATCH] corsia: embedding tables are lookups for the pool sizer, the
+ prefetch and hot weights
+
+---
+ common/corsia-experts.h    | 15 ++++++++++++---
+ src/llama-model-loader.cpp |  6 ++++--
+ 2 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index 88c617d..c24d455 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -95,8 +95,10 @@ struct corsia_experts {
+     // Read-only view of the model file; its pages are shared with llama.cpp's own mapping.
+     const uint8_t * map = nullptr;
+     size_t map_len = 0;
+-    // The weights every token reads whole: everything but the experts and the token embeddings.
++    // The weights every token reads whole: everything but the experts and the embedding
++    // tables, which are lookups (a token reads a few rows).
+     std::vector<std::pair<uint64_t, uint64_t>> first_ranges; // (offset, bytes)
++    uint64_t lookup_bytes = 0; // embedding tables (token_embd, per_layer_token_embd, ...)
+     float eps = 1e-6f;
+     int n_used = 0;
+     // What the KV cache needs, for sizing the expert pool from memory (from the model's metadata).
+@@ -275,7 +277,12 @@ struct corsia_experts {
+         for (const auto & l : layers) {
+             for (const auto & t : l) experts += t.stride * (uint64_t) t.n_expert;
+         }
+-        const uint64_t others = model_bytes > experts ? model_bytes - experts : 0;
++        // embedding tables are lookups: a token touches a few rows, so they need room for the
++        // rows in use (1 GiB here), not their whole size (26.8 GiB in one model with
++        // per-layer embeddings, which left a third of the room for experts)
++        const uint64_t lookups_kept = std::min<uint64_t>(lookup_bytes, 1024 * MiB);
++        uint64_t others = model_bytes > experts ? model_bytes - experts : 0;
++        others = others > lookup_bytes ? others - lookup_bytes + lookups_kept : lookups_kept;
+         const uint64_t kv = kv_cache_bytes(cparams);
+         const uint64_t fixed = 1152 * MiB; // compute buffers, the program, Corsia and room to breathe (gives the hand-measured sizes)
+         const uint64_t rest = others + kv + fixed;
+@@ -378,7 +385,9 @@ struct corsia_experts {
+                 router_at(il).bias = data + gguf_get_tensor_offset(g, i);
+                 continue;
+             }
+-            if (tt != nullptr && std::strstr(name, "_exps") == nullptr && std::strcmp(name, "token_embd.weight") != 0) {
++            if (tt != nullptr && std::strstr(name, "token_embd") != nullptr) {
++                lookup_bytes += ggml_nbytes(tt);
++            } else if (tt != nullptr && std::strstr(name, "_exps") == nullptr) {
+                 first_ranges.push_back({ data + gguf_get_tensor_offset(g, i), ggml_nbytes(tt) });
+             }
+             if (std::sscanf(name, "blk.%d.ffn_%31[a-z_]", &il, kind) != 2 || il < 0 || tt == nullptr) {
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 17726ce..88af42d 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1534,14 +1534,16 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+                 size_t n_exps = 0, exps_bytes = 0;
+                 for (const auto & it : weights_map) {
+                     const auto & w = it.second;
+-                    if (w.idx == idx && it.first.find("_exps") != std::string::npos) {
++                    // experts (read by the pool) and embedding tables (lookups: a few rows a
++                    // token, 27 GB in one model with per-layer embeddings)
++                    if (w.idx == idx && (it.first.find("_exps") != std::string::npos || it.first.find("token_embd") != std::string::npos)) {
+                         ranges.emplace_back(w.offs, w.offs + ggml_nbytes(w.tensor));
+                         n_exps++;
+                         exps_bytes += ggml_nbytes(w.tensor);
+                     }
+                 }
+                 if (n_exps > 0) {
+-                    LLAMA_LOG_INFO("%s: corsia: %zu expert tensors (%zu MiB) left to the expert pool, not prefetched\n",
++                    LLAMA_LOG_INFO("%s: corsia: %zu expert and embedding tensors (%zu MiB) not prefetched\n",
+                         __func__, n_exps, exps_bytes >> 20);
+                 }
+             }
+-- 
+2.53.0
+

@@ -67,6 +67,12 @@ corsia watch --light                    # light terminal; NO_COLOR=1 for no colo
 corsia watch --snapshot 120x36 --html   # one frame, for reviewing the design
 ```
 
+Whoever sets a machine up can say what they are doing in the watcher's Notes panel (it shows the last 8; the `X-Corsia` header keeps web pages out):
+
+```bash
+curl -s -H "X-Corsia: 1" --data-binary "Building llama.cpp for this processor" 127.0.0.1:7715/api/notes
+```
+
 To follow a run on another machine, run `corsia watch` there over ssh: the runs are in that machine's progress folder. Keys: up and down choose a run, f hides finished runs, q quits.
 
 ## Coding assistants: `corsia agent`

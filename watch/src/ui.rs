@@ -282,18 +282,22 @@ pub fn draw(f: &mut Frame, store: &Store, daemon: &Daemon, model: Option<&Model>
         Some(_) => 2,
         None => 0,
     };
-    let [header, _, body, _, mpanel, _, panel, _, footer] = Layout::vertical([
+    let notes_h = if daemon.notes.is_empty() { 0 } else { (daemon.notes.len() as u16 + 1).min(area.height.saturating_sub(panel_h + model_h + 10)) };
+    let [header, _, body, _, mpanel, _, npanel, _, panel, _, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(if model_h > 0 { 1 } else { 0 }),
         Constraint::Length(model_h),
+        Constraint::Length(if notes_h > 0 { 1 } else { 0 }),
+        Constraint::Length(notes_h),
         Constraint::Length(1),
         Constraint::Length(panel_h),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area);
+    draw_notes(f, npanel, daemon, th);
 
     draw_header(f, header, store, daemon, th);
     draw_footer(f, footer, store, daemon, view, th);
@@ -318,6 +322,23 @@ pub fn draw(f: &mut Frame, store: &Store, daemon: &Daemon, model: Option<&Model>
         draw_list(f, list, &runs, sel, th);
         draw_detail(f, detail, runs[sel], th);
     }
+}
+
+/// Notes from whoever is setting the machine up, newest last.
+fn draw_notes(f: &mut Frame, area: Rect, d: &Daemon, th: &Theme) {
+    if area.height == 0 {
+        return;
+    }
+    let w = area.width as usize;
+    let mut out = vec![Line::from(vec![Span::styled("Notes", bold(th.text)), Span::styled("  what is being done on this machine", s(th.muted))])];
+    let room = area.height.saturating_sub(1) as usize;
+    let start = d.notes.len().saturating_sub(room);
+    for n in &d.notes[start..] {
+        let (time, text) = n.split_once("  ").unwrap_or(("", n.as_str()));
+        let text: String = text.chars().take(w.saturating_sub(time.len() + 2)).collect();
+        out.push(Line::from(vec![Span::styled(format!("{time}  "), s(th.faint)), Span::styled(text, s(th.text))]));
+    }
+    f.render_widget(Paragraph::new(out), area);
 }
 
 /// What the model is writing: its thinking (dim) and its answer, the latest lines.

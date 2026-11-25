@@ -141,11 +141,13 @@ pub struct Daemon {
     pub drives: Vec<Drive>,
     pub total: VecDeque<f64>,
     pub peak: f64,
+    /// What whoever is setting the machine up says they are doing (POST /api/notes).
+    pub notes: Vec<String>,
 }
 
 impl Daemon {
     pub fn new(target: Target) -> Daemon {
-        Daemon { target, link: Link::Connecting, last: None, last_at: None, drives: Vec::new(), total: VecDeque::new(), peak: 0.0 }
+        Daemon { target, link: Link::Connecting, last: None, last_at: None, drives: Vec::new(), total: VecDeque::new(), peak: 0.0, notes: Vec::new() }
     }
 
     pub fn apply(&mut self, msg: Msg) {
@@ -188,6 +190,9 @@ impl Daemon {
                 d.rates.pop_front();
             }
             self.peak = self.peak.max(rate);
+        }
+        if let Some(n) = v["notes"].as_array() {
+            self.notes = n.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
         }
         self.total.push_back(sum);
         if self.total.len() > HISTORY {

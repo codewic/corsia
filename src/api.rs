@@ -2,7 +2,12 @@
 //!
 //! - `GET /api/status`: everything as JSON
 //! - `GET /api/events`: Server-Sent Events, a `status` event every second with per-drive
-//!   MB/s since the last one
+//!   MB/s since the last one and the latest notes
+//! - `GET /api/notes`: the latest notes as JSON
+//! - `POST /api/notes`: adds a note (the body, one line, up to 500 characters), for whoever
+//!   sets the machine up to say what they are doing; `corsia watch` shows them. The request
+//!   must carry an `X-Corsia` header, which a web page cannot add without asking first, so a
+//!   page open in a browser cannot write notes.
 //!
 //! Listens on 127.0.0.1 only and checks the Host header, so a web page elsewhere cannot
 //! reach it through DNS rebinding.
@@ -14,6 +19,39 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::engine::Engine;
+
+const NOTES_SHOWN: usize = 8;
+
+fn notes_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/corsia/notes.log"))
+}
+
+/// The latest notes, oldest first, as a JSON array of strings.
+fn notes_json() -> String {
+    let text = notes_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(NOTES_SHOWN);
+    let items: Vec<String> = lines[start..].iter().map(|l| crate::js(l)).collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Appends a note with the local time in front; keeps the file to its last 200 lines.
+fn add_note(body: &str) -> io::Result<()> {
+    let path = notes_path().ok_or_else(|| io::Error::other("no home folder"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let line: String = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ").chars().filter(|c| !c.is_control()).take(500).collect();
+    if line.is_empty() {
+        return Ok(());
+    }
+    let now = std::process::Command::new("date").arg("+%H:%M").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    text.push_str(&format!("{}  {line}\n", now.trim()));
+    let lines: Vec<&str> = text.lines().collect();
+    let keep = lines[lines.len().saturating_sub(200)..].join("\n") + "\n";
+    std::fs::write(&path, keep)
+}
 
 pub fn start(engine: Arc<Engine>, port: u16) -> io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
@@ -37,6 +75,8 @@ fn handle(mut stream: TcpStream, engine: &Engine, port: u16) -> io::Result<()> {
     let mut parts = line.split_whitespace();
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let mut host_ok = false;
+    let mut marked = false;
+    let mut length = 0usize;
     let mut total = line.len();
     loop {
         let mut h = String::new();
@@ -51,17 +91,31 @@ fn handle(mut stream: TcpStream, engine: &Engine, port: u16) -> io::Result<()> {
             if k.eq_ignore_ascii_case("host") {
                 let v = v.trim();
                 host_ok = v == format!("127.0.0.1:{port}") || v == format!("localhost:{port}");
+            } else if k.eq_ignore_ascii_case("x-corsia") {
+                marked = true;
+            } else if k.eq_ignore_ascii_case("content-length") {
+                length = v.trim().parse().unwrap_or(0);
             }
         }
     }
     if !host_ok {
         return respond(&mut stream, 403, "text/plain", "Corsia only answers requests addressed to 127.0.0.1 or localhost.\n");
     }
+    if method == "POST" && path == "/api/notes" {
+        if !marked {
+            return respond(&mut stream, 403, "text/plain", "Notes need an X-Corsia header.\n");
+        }
+        let mut body = vec![0u8; length.min(4096)];
+        std::io::Read::read_exact(&mut reader, &mut body)?;
+        add_note(&String::from_utf8_lossy(&body))?;
+        return respond(&mut stream, 200, "application/json", &notes_json());
+    }
     if method != "GET" {
-        return respond(&mut stream, 405, "text/plain", "Only GET is supported.\n");
+        return respond(&mut stream, 405, "text/plain", "Only GET is supported (and POST to /api/notes).\n");
     }
     match path {
         "/api/status" => respond(&mut stream, 200, "application/json", &engine.status_json()),
+        "/api/notes" => respond(&mut stream, 200, "application/json", &notes_json()),
         "/api/events" => events(&mut stream, engine),
         "/" => respond(&mut stream, 200, "text/plain", "Corsia is running.\nStatus: /api/status\nLive events: /api/events\n"),
         _ => respond(&mut stream, 404, "text/plain", "Not found. Try /api/status or /api/events.\n"),
@@ -102,7 +156,7 @@ fn events(stream: &mut TcpStream, engine: &Engine) -> io::Result<()> {
             .collect();
         let status = engine.status_json();
         // Splice the live rates into the status object.
-        let body = format!("{},\"rate_mb_s\":{{{}}}}}", &status[..status.len() - 1], rates.join(","));
+        let body = format!("{},\"rate_mb_s\":{{{}}},\"notes\":{}}}", &status[..status.len() - 1], rates.join(","), notes_json());
         write!(stream, "event: status\ndata: {body}\n\n")?;
         stream.flush()?;
     }
