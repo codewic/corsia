@@ -149,7 +149,7 @@ static int guard(size_t gib) {
     size_t * held = calloc(n, sizeof *held);
     if (n < 10) return 1;
     const char * thp_env = getenv("MEMBW_THP");
-    const int thp = thp_env ? atoi(thp_env) : 1;
+    const int thp = thp_env ? atoi(thp_env) : 0; // plain pages: with memory full of file cache, huge pages made measuring slow
     for (size_t i = 0; i < n; i++) {
         if (i % 4 == 0 && meminfo_mib("MemAvailable") < 3072) {
             n = i;
