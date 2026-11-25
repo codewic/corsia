@@ -35,10 +35,48 @@ OUT="${2:-${MODEL%.gguf}-cpu.gguf}"
 [ -x "$B/llama-quantize" ] || die "no llama-quantize in $B"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
-echo "Timing each format's expert matmul on this CPU ($(lscpu | sed -n 's/^Model name: *//p'))..."
-systemd-run --user --scope --quiet -p MemoryMax=4G -p MemorySwapMax=0 \
-  "$B/test-backend-ops" perf -b CPU -o MUL_MAT_ID -p 'type_b=f32,n_mats=128,n_used=8,b=0,m=768,n=1,k=2048' 2>&1 \
-  | sed -nE 's/.*MUL_MAT_ID\(type_a=([a-zA-Z0-9_]+),.* - +([0-9.]+) us\/run.*/\1 \2/p' > "$TMP/speed.txt"
+# The model's own expert shape: formats are timed at it, because which format is fastest
+# depends on the shape (Q4_K beat IQ4_XS 1.26x at 768 x 2048 and lost 15% in a model with
+# 640 x 2560 experts, 10 of 512 used).
+SHAPE="$(python3 -I - "$MODEL" <<'SHAPE_PY'
+import struct, sys
+f = open(sys.argv[1], "rb")
+rd = lambda fmt: struct.unpack("<" + fmt, f.read(struct.calcsize("<" + fmt)))[0]
+rs = lambda: f.read(rd("Q")).decode("utf-8", "replace")
+FMT = {0:"B",1:"b",2:"H",3:"h",4:"I",5:"i",6:"f",7:"?",10:"Q",11:"q",12:"d"}
+assert f.read(4) == b"GGUF"; rd("I"); nt = rd("Q"); nkv = rd("Q")
+def val(t):
+    if t == 8: return rs()
+    if t == 9:
+        et = rd("I"); n = rd("Q")
+        for _ in range(n): val(et)
+        return None
+    return rd(FMT[t])
+meta = {}
+for _ in range(nkv):
+    k = rs(); meta[k] = val(rd("I"))
+used = next((v for k, v in meta.items() if k.endswith(".expert_used_count")), None)
+for _ in range(nt):
+    name = rs(); nd = rd("I"); dims = [rd("Q") for _ in range(nd)]; rd("I"); rd("Q")
+    if name.endswith("ffn_gate_exps.weight") and nd == 3 and used:
+        print(f"{dims[2]},{used},{dims[1]},{dims[0]}"); break
+SHAPE_PY
+)"
+if [ -n "$SHAPE" ]; then
+  IFS=, read -r NM NU MM KK <<< "$SHAPE"
+  # the time depends on the experts used and their shape, not on how many exist: 64 keep the
+  # test inside its memory cap (all 512 of one model's were 839 M weights)
+  [ "$NM" -le 64 ] || NM=64
+  SHAPE="$NM,$NU,$MM,$KK"
+  FILTER="type_b=f32,n_mats=$NM,n_used=$NU,b=0,m=$MM,n=1,k=$KK"
+  echo "Timing each format's expert matmul on this CPU ($(lscpu | sed -n 's/^Model name: *//p')) at this model's shape: $NU of $NM experts, $MM x $KK..."
+else
+  FILTER='type_b=f32,n_mats=128,n_used=8,b=0,m=768,n=1,k=2048'
+  echo "Timing each format's expert matmul on this CPU ($(lscpu | sed -n 's/^Model name: *//p'))..."
+fi
+systemd-run --user --scope --quiet -p MemoryMax=4G -p MemorySwapMax=0 --setenv=CORSIA_PERF_MMID="$SHAPE" \
+  "$B/test-backend-ops" perf -b CPU -o MUL_MAT_ID -p "$FILTER" 2>&1 \
+  | sed -nE 's/.*MUL_MAT_ID\(type_a=([a-zA-Z0-9_]+),.* - +([0-9.]+) us\/run.*/\1 \2/p' | awk '!seen[$1]++' > "$TMP/speed.txt"
 [ -s "$TMP/speed.txt" ] || die "test-backend-ops gave no timings"
 
 rc=0

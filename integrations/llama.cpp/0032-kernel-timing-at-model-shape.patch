@@ -1,0 +1,40 @@
+From ea9a0ba3d40c4918feea03966f830b6967ac1e69 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 04:03:00 +0000
+Subject: [PATCH] corsia: kernel timing case at a model's own expert shape
+ (CORSIA_PERF_MMID)
+
+---
+ tests/test-backend-ops.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e7314fe..50d4951 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13598,6 +13598,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // Corsia: CORSIA_PERF_MMID="n_mats,n_used,m,k" adds a one-token expert matmul at a model's
++    // own shape in every weight format cpu-tune.sh may choose, so formats are timed where they
++    // will run (a format that wins at 768 x 2048 lost 15% at 640 x 2560 with 10 of 512 experts).
++    if (const char * e = getenv("CORSIA_PERF_MMID")) {
++        int n_mats = 0, n_used = 0;
++        long long m = 0, k = 0;
++        if (sscanf(e, "%d,%d,%lld,%lld", &n_mats, &n_used, &m, &k) == 4 && n_mats > 0 && n_used > 0 && m > 0 && k > 0) {
++            for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
++                                     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
++                if (k % ggml_blck_size(type_a) == 0) {
++                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, 1, k));
++                }
++            }
++        }
++    }
++
+     // qwen3-30b-a3b
+     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
+-- 
+2.53.0
+

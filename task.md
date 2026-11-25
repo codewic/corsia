@@ -824,3 +824,20 @@ With the high bits copied once into an array of their own (82 of every 210 bytes
 Shared K scoring passed its exactness check: KL 0.000000 against the per-query calls, maximum 0.000046 (the level of the old path against its own saved output).
 
 **The guard squeezed the machine once, fixed.** With memory full of file cache the guard took more than the two minutes `start` waited for it, the service was started anyway and loaded beside a guard still holding nearly all the memory (272 MiB free, 805 MiB read in 290 s). Now the guard stops taking memory when under 3 GiB would be left available, and `start` waits five minutes and then stops the guard instead of loading beside it. Under a full file cache (15.6 GB cached) the guard measured in 30 s without huge pages and left 9.6 GB free while holding.
+
+### A 93 GB model on a VM, the 30B beside it, and a tuner fix (2026-11-25, a VirtualBox VM: Xeon E3-1505M v5, 6 vCPUs, AVX2, 46 GB, NVMe behind a virtual SATA controller)
+
+Setup from GitHub on a fresh machine: corsia and the watcher built with cargo, llama.cpp b12283 with all patches applied by `git apply` (the first build failed on llama-server's browser interface: its prebuilt assets no longer match this llama.cpp version; `corsia-build.sh` now builds without it).
+
+**Qwen3.8 Flash Next IQ4_XS** (architecture qwen4exp: 48 layers, 512 experts with 10 used, state-space layers, hyper-connections, an attention indexer and a 26.8 GB per-layer embedding table; 91 GiB in three files, merged into one for Corsia in 442 s). A token reads about 1.2 GB of experts and 2.8 GB of dense weights, so even fully in memory its ceiling at the VM's 24 GB/s is about 6 tok/s.
+- Plain llama.cpp from the split files: 1.04 tok/s.
+- Corsia, 40 GiB cap, pool of 35 GiB (55% of the experts), ready in 15 s: 2.0 to 2.8 tok/s depending on the VM's load (2.6 to 2.8 in the first runs). CPU-bound: 4 threads at 400%, no disk wait. 6 threads are no faster than 4.
+- Fixed for it (fork 27ac6c6, patch 0031): embedding tables are lookups, not weights to keep in memory. The pool sizer counted the 26.8 GB table whole (a third of the room for experts), the loader prefetched it and "hot weights first" read it.
+- Op profile: experts 22%, attention and state-space projections 14%, lookups 6.5%, output layer 5%, the rest spread over the model's other parts.
+- The drive inside the VM: 1.1 GB/s sequential, 0.7 to 0.9 GB/s random at any queue depth: VirtualBox's emulated ICH8M AHCI controller caps the NVMe behind it.
+
+**Formats: the tuner timed the wrong shape** (fixed, patch 0032 and `cpu-tune.sh`). It chose Q4_K for the IQ4_XS tensors (1.26x faster at 768 x 2048, the 30B models' shape). The rewritten copy was slower in the model, back to back with the original in the service: 1.79 to 1.89 tok/s against 2.00 to 2.20. At this model's own shape (10 of 64 experts, 640 x 2560) Q4_K is only 1.096x faster than IQ4_XS, under the 1.10 threshold. The tuner now reads the model's expert shape and counts and times every format there (`CORSIA_PERF_MMID` adds the case to test-backend-ops; 64 experts at most, since all 512 did not fit the test's memory cap); for this model it now changes nothing. Lesson: `local-agent.sh` prefers a `-cpu.gguf` copy when one exists, so a comparison against the original must move the copy aside.
+
+**Qwen3-Coder-30B UD-Q2_K_XL on the same VM** (with the format copy using two cores meanwhile): llama-bench 10.9 tok/s idle and 9.0 then, plain llama-server 8.0 to 8.2, the Corsia service 7.4 to 8.2; prompts 13 to 20 tok/s. Thread wake-ups cost little even in a VM (polling 7.4 to 8.2 against 7.4). A bug-fix agent task: 159 s with drafts off, 215 s with drafts on (on a CPU-bound machine a rejected draft is wasted arithmetic). Writing inside a tool call is about 11% slower than plain text (6.6 against 7.45 tok/s).
+
+**Notes in corsia watch**: `POST /api/notes` (with an `X-Corsia` header) appends to `~/.cache/corsia/notes.log`; the last 8 notes ride on every status event and the watcher shows them in a Notes panel, on the machine and anywhere its port is forwarded.
