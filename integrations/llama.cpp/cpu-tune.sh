@@ -22,6 +22,8 @@ set -euo pipefail
 
 WORK="${WORK:-$HOME/.cache/corsia-build}"
 B="$WORK/llama.cpp/build/bin"
+# the build that has the tuner's two programs (either build directory)
+[ -x "$B/test-backend-ops" ] || B="$WORK/llama.cpp/build-noomp/bin"
 MIN_GAIN="${MIN_GAIN:-1.10}"
 MAX_GROWTH="${MAX_GROWTH:-1.35}"
 die() { echo "cpu-tune: $*" >&2; exit 1; }
