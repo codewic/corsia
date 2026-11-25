@@ -1,0 +1,112 @@
+From 42a55e2c4fbab52d4eddbe67a7f0ecdba91762cf Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 14:38:10 +0000
+Subject: [PATCH 2/3] corsia: op timer behind CORSIA_OP_PROFILE
+
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 68 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 68 insertions(+)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index e4727f3..4b80b15 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3158,6 +3158,62 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++// Corsia: CORSIA_OP_PROFILE=1 times every graph node on thread 0, from its start to the barrier
++// after it (so the wall time all threads spend on it), adds the times up per op and weight
++// (blk.N. prefixes dropped) and prints the table to stderr at exit.
++#define CORSIA_PROF_MAX 256
++static struct { char key[64]; double us; long n; } corsia_prof[CORSIA_PROF_MAX];
++static int corsia_prof_n  = 0;
++static int corsia_prof_on = -1;
++
++static void corsia_prof_dump(void) {
++    double total = 0;
++    for (int i = 0; i < corsia_prof_n; i++) total += corsia_prof[i].us;
++    for (int i = 0; i < corsia_prof_n; i++) {
++        for (int j = i + 1; j < corsia_prof_n; j++) {
++            if (corsia_prof[j].us > corsia_prof[i].us) {
++                char tmp[sizeof corsia_prof[0]];
++                memcpy(tmp, &corsia_prof[i], sizeof tmp);
++                memcpy(&corsia_prof[i], &corsia_prof[j], sizeof tmp);
++                memcpy(&corsia_prof[j], tmp, sizeof tmp);
++            }
++        }
++    }
++    fprintf(stderr, "corsia op profile: %.1f s in graph nodes\n", total / 1e6);
++    for (int i = 0; i < corsia_prof_n && i < 40; i++) {
++        fprintf(stderr, "  %5.1f%%  %9.1f ms  %7ld  %s\n", 100.0 * corsia_prof[i].us / (total > 0 ? total : 1),
++            corsia_prof[i].us / 1e3, corsia_prof[i].n, corsia_prof[i].key);
++    }
++}
++
++static void corsia_prof_add(const struct ggml_tensor * node, double us) {
++    char key[64];
++    const char * w = "";
++    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] != NULL) {
++        w = node->src[0]->name;
++        if (strncmp(w, "blk.", 4) == 0) {
++            const char * dot = strchr(w + 4, '.');
++            if (dot != NULL) w = dot + 1;
++        }
++    }
++    snprintf(key, sizeof key, "%s %s", ggml_op_desc(node), w);
++    char * suffix = strstr(key, ".weight");
++    if (suffix != NULL) *suffix = 0;
++    for (int i = 0; i < corsia_prof_n; i++) {
++        if (strcmp(corsia_prof[i].key, key) == 0) {
++            corsia_prof[i].us += us;
++            corsia_prof[i].n++;
++            return;
++        }
++    }
++    if (corsia_prof_n < CORSIA_PROF_MAX) {
++        snprintf(corsia_prof[corsia_prof_n].key, sizeof corsia_prof[0].key, "%s", key);
++        corsia_prof[corsia_prof_n].us = us;
++        corsia_prof[corsia_prof_n].n  = 1;
++        corsia_prof_n++;
++    }
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3198,6 +3254,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++        const bool corsia_timed = state->ith == 0 && corsia_prof_on > 0;
++        const int64_t corsia_t0 = corsia_timed ? ggml_time_us() : 0;
++
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+@@ -3216,6 +3275,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++        if (corsia_timed) {
++            corsia_prof_add(node, (double) (ggml_time_us() - corsia_t0));
++        }
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+@@ -3449,6 +3511,12 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
+ }
+ 
+ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
++    if (corsia_prof_on < 0) {
++        const char * e = getenv("CORSIA_OP_PROFILE");
++        corsia_prof_on = e != NULL && atoi(e) > 0;
++        if (corsia_prof_on) atexit(corsia_prof_dump);
++    }
++
+     ggml_cpu_init();
+ 
+     GGML_ASSERT(cplan);
+-- 
+2.53.0
+

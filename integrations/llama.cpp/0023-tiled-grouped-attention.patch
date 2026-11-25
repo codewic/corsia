@@ -1,0 +1,129 @@
+From 225c5291cc49be21ba33843fef1f0c5b971ceca2 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:59:23 +0000
+Subject: [PATCH 2/5] corsia: tiled grouped attention for batches of 8 to 63
+ tokens
+
+---
+ ggml/src/ggml-cpu/ops.cpp | 98 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 97 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index caf047b..b795881 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9477,6 +9477,15 @@ static bool corsia_gqa_block_on() {
+     return on;
+ }
+ 
++// Tiled grouped attention for batches whose KV group has 64 or more (token, head) rows (8 or more
++// tokens in Qwen3-30B-A3B): each 64-row K and V tile is converted to f32 once and multiplied
++// against every row of the group, as the prompt path does per head. CORSIA_GQA_TILED=0 keeps the
++// row loop (identical to ggml's per-row path); this one adds in a different order.
++static bool corsia_gqa_tiled_on() {
++    static const bool on = [] { const char * e = getenv("CORSIA_GQA_TILED"); return !(e && strcmp(e, "0") == 0); }();
++    return on;
++}
++
+ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_params * params, ggml_tensor * dst) {
+     const ggml_tensor * q    = dst->src[0];
+     const ggml_tensor * k    = dst->src[1];
+@@ -9554,7 +9563,94 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+             S[j] = 0.0f;
+         }
+         const int64_t ik2 = g, iv2 = g; // rk2 == rv2 == R
+-        if (corsia_gqa_block_on() && J == R) { // one token: j is the head
++        if (J >= BLK && corsia_gqa_tiled_on()) {
++            static thread_local std::vector<float> tb;
++            tb.resize((size_t) J*DK + (size_t) J*DV + 2*(size_t) J*BLK + (size_t) DK*BLK + (size_t) BLK*DV + std::max(DK, DV) + 64);
++            float * QF  = tb.data();         // [J][DK] queries
++            float * ACC = QF + J*DK;         // [J][DV] output accumulators
++            float * W   = ACC + J*DV;        // [J][BLK] mask, then scores, then weights
++            float * SC  = W + J*BLK;         // [J][BLK] raw scores
++            float * KT  = SC + J*BLK;        // [DK][BLK] K tile, transposed
++            float * VB  = KT + DK*BLK;       // [BLK][DV] V tile
++            float * ROW = VB + BLK*DV;       // one converted K row
++            ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
++            for (int64_t j = 0; j < J; ++j) {
++                const int64_t iq1 = n0 + j / R, iq2 = g*R + j % R;
++                memcpy(QF + j*DK, (const char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3), DK*sizeof(float));
++            }
++            memset(ACC, 0, J*DV*sizeof(float));
++            for (int64_t ic0 = 0; ic0 < nek1; ic0 += BLK) {
++                const int64_t nb_ = std::min<int64_t>(BLK, nek1 - ic0);
++                bool any = false;
++                for (int64_t j = 0; j < J; ++j) {
++                    float * w = W + j*BLK;
++                    for (int64_t b = 0; b < nb_; ++b) {
++                        w[b] = mp[j] ? slope[j]*GGML_CPU_FP16_TO_FP32(mp[j][ic0 + b]) : 0.0f;
++                        any |= w[b] != -INFINITY;
++                    }
++                    for (int64_t b = nb_; b < BLK; ++b) {
++                        w[b] = -INFINITY;
++                    }
++                }
++                if (!any) {
++                    continue;
++                }
++                for (int64_t b = 0; b < nb_; ++b) {
++                    const char * k_data = (const char *) k->data + ((ic0 + b)*nbk1 + ik2*nbk2);
++                    const float * krow = (const float *) k_data;
++                    if (k_to_float) {
++                        k_to_float(k_data, ROW, DK);
++                        krow = ROW;
++                    }
++                    for (int64_t d = 0; d < DK; ++d) {
++                        KT[d*BLK + b] = krow[d];
++                    }
++                    const char * v_data = (const char *) v->data + ((ic0 + b)*nbv1 + iv2*nbv2);
++                    if (v_to_float) {
++                        v_to_float(v_data, VB + b*DV, DV);
++                    } else {
++                        memcpy(VB + b*DV, v_data, DV*sizeof(float));
++                    }
++                }
++                if (nb_ < BLK) {
++                    for (int64_t d = 0; d < DK; ++d) {
++                        memset(KT + d*BLK + nb_, 0, (BLK - nb_)*sizeof(float));
++                    }
++                    memset(VB + nb_*DV, 0, (BLK - nb_)*DV*sizeof(float));
++                }
++                memset(SC, 0, J*BLK*sizeof(float));
++                simd_gemm(SC, QF, KT, (int) J, (int) DK, (int) BLK);
++                for (int64_t j = 0; j < J; ++j) {
++                    float * w = W + j*BLK;
++                    const float * sc_j = SC + j*BLK;
++                    for (int64_t b = 0; b < nb_; ++b) {
++                        if (w[b] == -INFINITY) {
++                            continue;
++                        }
++                        float sv = sc_j[b]*scale;
++                        if (logit_softcap != 0.0f) {
++                            sv = logit_softcap*tanhf(sv);
++                        }
++                        w[b] += sv;
++                    }
++                    float bmax;
++                    ggml_vec_max_f32(BLK, &bmax, w);
++                    if (bmax == -INFINITY) {
++                        memset(w, 0, BLK*sizeof(float));
++                        continue;
++                    }
++                    if (bmax > M[j]) {
++                        const float ms = expf(M[j] - bmax);
++                        ggml_vec_scale_f32(DV, ACC + j*DV, ms);
++                        S[j] *= ms;
++                        M[j] = bmax;
++                    }
++                    S[j] += (float) ggml_vec_soft_max_f32(BLK, w, w, M[j]);
++                }
++                simd_gemm(ACC, W, VB, (int) J, (int) BLK, (int) DV);
++            }
++            memcpy(VKQ, ACC, J*DV*sizeof(float)); // the shared output step below normalises and stores
++        } else if (corsia_gqa_block_on() && J == R) { // one token: j is the head
+             // Blocks of BLK cache rows: score them for every head, then one vectorised softmax
+             // and one rescale per head and block, and the weighted sum of the block's V rows
+             // for all R heads as one small matrix product over V rows converted once.
+-- 
+2.53.0
+

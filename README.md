@@ -91,10 +91,11 @@ corsia agent --upstream 127.0.0.1:8080 --snapshots ~/.cache/corsia/kv
 
 Then point the assistant's OpenAI-compatible provider at `http://127.0.0.1:7720/v1`.
 
-The same three, as one service under a memory cap, in one command (the pool sizes itself to what the cap or the free memory leaves):
+The same three, as one service under a memory cap. `setup` runs once per machine and model: it checks the processor, the memory and the drive, builds what is missing, writes the copy of the model in the weight formats this processor computes fastest, measures whether the memory is even (modules of different sizes leave part of it at half speed) and saves what it found in `~/.config/corsia/machine.env`. `start` then picks the cap itself: what the model needs, or what is free less a reserve for the rest of the machine (`CAP=10` sets it by hand).
 
 ```bash
-CAP=10 integrations/llama.cpp/local-agent.sh start     # status, logs, stop
+integrations/llama.cpp/local-agent.sh setup     # once
+integrations/llama.cpp/local-agent.sh start     # status, logs, stop
 ```
 
 For opencode, add a provider with `"npm": "@ai-sdk/openai-compatible"` and `"baseURL": "http://127.0.0.1:7720/v1"`, model `local`, and give the local model a lean agent (read, edit, write, glob, grep, bash; the rest off) so its prompt stays near 5,000 tokens. Without `corsia serve` (a model that fits in RAM), leave out `CORSIA_SOCKET` and load the model from its own path. llama-server comes from the Corsia fork of llama.cpp (see [integrations/llama.cpp](integrations/llama.cpp/README.md)); stock llama-server works too, without expert streaming. On a machine with the model in RAM or cores to spare, add `--spec-type ngram-simple` to llama-server: assistants copy a lot from their context, and n-gram drafts made coding answers 2.2 times faster with the same output in a test on a 4-core desktop (on a 2-core laptop under a memory cap it was slower). `--plain` passes requests through unchanged and only measures, for comparing. `--snapshots auto` picks a folder on the fastest writable drive and prints it, for llama-server's `--slot-save-path`. `--volatile LABEL` adds a "Label: value" line your assistant uses to the ones that move.

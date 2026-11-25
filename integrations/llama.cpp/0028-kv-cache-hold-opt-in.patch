@@ -1,0 +1,104 @@
+From 4c840ea8d5063281f2cb6e3a35a8d57ef87f124d Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:05:05 +0000
+Subject: [PATCH 3/4] corsia: KV cache hold for fast memory, off by default
+
+---
+ common/corsia-experts.h | 60 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index 88cec73..88c617d 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -220,6 +220,55 @@ struct corsia_experts {
+     // now less a share kept for the rest of the system), less what the model needs outside the
+     // pool (the weights that are not experts, the KV cache, compute buffers, the program and
+     // Corsia itself). Measured by hand before: 3,584 MiB under a 6 GiB cap, 7,680 under 10 GiB.
++    // The KV cache's size for these context settings, 0 when the model's shape is not known.
++    uint64_t kv_cache_bytes(const llama_context_params & cparams) const {
++        const uint32_t heads_kv = n_head_kv ? n_head_kv : n_head;
++        const uint32_t kl = key_len ? key_len : (n_head ? n_embd / n_head : 0);
++        const uint32_t vl = value_len ? value_len : kl;
++        const uint64_t n_ctx = cparams.n_ctx ? cparams.n_ctx : ctx_train;
++        if (n_block && heads_kv && kl) {
++            return n_ctx * n_block * (ggml_row_size(cparams.type_k, (int64_t) heads_kv * kl) + ggml_row_size(cparams.type_v, (int64_t) heads_kv * vl));
++        }
++        return 0;
++    }
++
++    // Memory held for the KV cache while the pool fills (CORSIA_KV_FIRST=1 turns it on: not
++    // measured yet, so it is off by default). The
++    // cache is created after the pool is warm, so on a machine with uneven memory, where a
++    // guard gives the load the fast part first, the experts would take all of it and the cache
++    // would land in the slow part. At a few thousand tokens of context a token streams the
++    // cache as it streams the weights (about 365 MB at 7,000 tokens in Qwen3-30B-A3B). This
++    // takes the cache's size right after the weights every token uses and gives it back when
++    // the pool is warm, just before the cache itself is created and cleared.
++    void * kv_hold = nullptr;
++    size_t kv_hold_len = 0;
++
++    void hold_for_kv(const llama_context_params & cparams) {
++        if (const char * e = std::getenv("CORSIA_KV_FIRST"); e == nullptr || std::atoi(e) == 0) {
++            return;
++        }
++        const uint64_t kv = kv_cache_bytes(cparams);
++        if (kv == 0) {
++            return;
++        }
++        void * m = mmap(nullptr, (size_t) kv, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (m == MAP_FAILED) {
++            return;
++        }
++        std::memset(m, 0, (size_t) kv); // touch it: this is what takes the memory
++        kv_hold = m;
++        kv_hold_len = (size_t) kv;
++    }
++
++    void release_kv_hold() {
++        if (kv_hold != nullptr) {
++            munmap(kv_hold, kv_hold_len);
++            LOG_INF("corsia: held %zu MiB for the KV cache while the pool filled\n", kv_hold_len >> 20);
++            kv_hold = nullptr;
++            kv_hold_len = 0;
++        }
++    }
++
+     uint64_t auto_pool_bytes(uint64_t model_bytes, const llama_context_params & cparams) const {
+         const uint64_t MiB = 1ull << 20;
+         uint64_t experts = 0;
+@@ -227,14 +276,7 @@ struct corsia_experts {
+             for (const auto & t : l) experts += t.stride * (uint64_t) t.n_expert;
+         }
+         const uint64_t others = model_bytes > experts ? model_bytes - experts : 0;
+-        uint64_t kv = 0;
+-        const uint32_t heads_kv = n_head_kv ? n_head_kv : n_head;
+-        const uint32_t kl = key_len ? key_len : (n_head ? n_embd / n_head : 0);
+-        const uint32_t vl = value_len ? value_len : kl;
+-        const uint64_t n_ctx = cparams.n_ctx ? cparams.n_ctx : ctx_train;
+-        if (n_block && heads_kv && kl) {
+-            kv = n_ctx * n_block * (ggml_row_size(cparams.type_k, (int64_t) heads_kv * kl) + ggml_row_size(cparams.type_v, (int64_t) heads_kv * vl));
+-        }
++        const uint64_t kv = kv_cache_bytes(cparams);
+         const uint64_t fixed = 1152 * MiB; // compute buffers, the program, Corsia and room to breathe (gives the hand-measured sizes)
+         const uint64_t rest = others + kv + fixed;
+         const uint64_t cap = cgroup_limit();
+@@ -876,6 +918,7 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+                 }
+             }
+             s->read_first(model_path.c_str());
++            s->hold_for_kv(cparams);
+             auto p = std::make_unique<corsia_pool>();
+             int64_t experts = 0;
+             for (const auto & l : s->layers) {
+@@ -900,6 +943,7 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+                 }
+             }
+         }
++        s->release_kv_hold(); // the pool is warm: the context, and its KV cache, come next
+         if (s->swap_on) {
+             LOG_INF("corsia: residency-aware routing on: up to %d experts per layer swapped for runners-up already in memory (score ratio %.2f, within %d places)\n",
+                 s->swap_max, s->swap_ratio, s->swap_depth);
+-- 
+2.53.0
+

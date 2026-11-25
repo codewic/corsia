@@ -4,41 +4,11 @@ Date: Mon, 23 Nov 2026 20:07:04 +0000
 Subject: [PATCH] corsia: size the expert pool from memory by default
 
 ---
- CORSIA.md               |   4 +-
  common/common.cpp       |   3 +-
  common/corsia-experts.h | 115 +++++++++++++++++++++++++++++++++++++++-
  common/corsia-pool.h    |   2 +-
- 4 files changed, 119 insertions(+), 5 deletions(-)
+ 3 files changed, 116 insertions(+), 4 deletions(-)
 
-diff --git a/CORSIA.md b/CORSIA.md
-index cf2c9e6..c4d04ad 100644
---- a/CORSIA.md
-+++ b/CORSIA.md
-@@ -20,6 +20,7 @@ upstream llama.cpp.
- | Complete trace lines | `common/corsia-experts.h` | A trace line is written only when every layer recorded its experts |
- | Expert pointer table | `ggml/src/ggml-cpu/ggml-cpu.c`, `tiled/tiled.cpp`, `ggml-cpu.cpp` | The expert matmul can take each expert's weights from a pointer table (`ggml_backend_cpu_set_expert_ptrs`), so experts can live outside their tensor |
- | Expert pool | `common/corsia-pool.h` | Experts live in memory the engine owns, read by Corsia straight from its drives (no page cache, no faults, no reclaim), least recently used evicted, warm-started from a per-model usage profile |
-+| Pool sized from memory | `common/corsia-experts.h` | On by default: the pool takes what the memory cap (or the free memory) leaves after the other weights, the KV cache and the program |
- | Residency-aware routing | `common/corsia-experts.h` | A chosen expert that is not in memory is swapped for a close runner-up that is, before the weights are gathered |
- | Confidence-based skipping | `common/corsia-experts.h` | Experts under a share of the layer's weight are skipped (off: it moved the output too much at useful thresholds) |
- | Build script | `scripts/corsia-build.sh` | The release build Corsia uses |
-@@ -33,7 +34,7 @@ upstream llama.cpp.
- | `CORSIA_PREDICT_EXTRA` | `0` | Guesses beyond the model's own top-k |
- | `CORSIA_TRACE` | unset | File to record routing traces in. Works without `CORSIA_SOCKET` |
- | `CORSIA_COOL` | on | `0` keeps the OpenMP runtime's default spinning |
--| `CORSIA_POOL_MIB` | unset | Size of the expert pool. Fit it to the memory you give the model (3584 under a 6 GiB cap for Qwen3-30B-A3B Q2). Turns guessing ahead off and swapping on |
-+| `CORSIA_POOL_MIB` | `auto` | Size of the expert pool in MiB, `auto` to size it from memory, `0` for no pool. `auto` uses the cgroup's memory cap, or the memory free at start less a tenth of the machine (at least 1 GiB) for everything else, then leaves room for the weights that are not experts, the KV cache and 1.1 GiB for the program. The pool turns guessing ahead off and swapping on |
- | `CORSIA_POOL_PROFILE` | `~/.cache/corsia/<model>.pool-profile` | Where the pool keeps its usage profile |
- | `CORSIA_SWAP` | on with the pool, else off | Residency-aware routing; `0` turns it off. `CORSIA_SWAP_RATIO` (0.5), `CORSIA_SWAP_MAX` (2), `CORSIA_SWAP_DEPTH` (8) tune it |
- | `CORSIA_SKIP` | off | Skip experts under this share of the layer's weight; `CORSIA_SKIP_MIN` (4) are always kept |
-@@ -56,6 +57,7 @@ Three things keep it from turning that waiting into heat:
- 
- - Expert pool: output identical to the unchanged model (KL divergence 0.000001, same top token 100%), prompt about twice as fast.
- - Pool + swapping: 22% faster than guessing on the page cache in cool conditions (2.29 against 1.87 tok/s), 38% in hot ones (1.93 against 1.40); swapping costs KL divergence 0.012, same top token 97%.
-+- More memory: 10 GiB against 6 GiB gave 3.8 against 2.7 tok/s (41%) and prompts 2.7 times faster; the automatic size picks what was tuned by hand.
- - Skipping under 0.1 of the weight dropped 40% of experts but moved the output to KL divergence 0.148 (84% same top token): not used.
- 
- ## Building
 diff --git a/common/common.cpp b/common/common.cpp
 index 99f254a..7bf96ab 100644
 --- a/common/common.cpp

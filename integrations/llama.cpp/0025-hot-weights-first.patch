@@ -1,0 +1,145 @@
+From 33f75109480439bac77a570f10c762a2f627eb6d Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:32:24 +0000
+Subject: [PATCH 4/5] corsia: hot weights first, tiered pool warm, load guard
+ accounting
+
+---
+ common/corsia-experts.h | 46 ++++++++++++++++++++++++++++++++++++++++-
+ common/corsia-pool.h    | 24 ++++++++++++++-------
+ 2 files changed, 61 insertions(+), 9 deletions(-)
+
+diff --git a/common/corsia-experts.h b/common/corsia-experts.h
+index d9f1d22..f72e0e8 100644
+--- a/common/corsia-experts.h
++++ b/common/corsia-experts.h
+@@ -53,8 +53,10 @@
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <sys/vfs.h>
++#include <unistd.h>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ 
+ #include <cerrno>
+@@ -93,6 +95,8 @@ struct corsia_experts {
+     // Read-only view of the model file; its pages are shared with llama.cpp's own mapping.
+     const uint8_t * map = nullptr;
+     size_t map_len = 0;
++    // The weights every token reads whole: everything but the experts and the token embeddings.
++    std::vector<std::pair<uint64_t, uint64_t>> first_ranges; // (offset, bytes)
+     float eps = 1e-6f;
+     int n_used = 0;
+     // What the KV cache needs, for sizing the expert pool from memory (from the model's metadata).
+@@ -235,7 +239,13 @@ struct corsia_experts {
+         const uint64_t rest = others + kv + fixed;
+         const uint64_t cap = cgroup_limit();
+         const uint64_t total = meminfo("MemTotal");
+-        const uint64_t avail = meminfo("MemAvailable");
++        // CORSIA_GUARD_MIB: memory a load guard (membw guard) is holding for this load and
++        // will let go of as the pool fills: it counts as free.
++        uint64_t guard_held = 0;
++        if (const char * e = std::getenv("CORSIA_GUARD_MIB")) {
++            guard_held = (uint64_t) std::max(0LL, std::atoll(e)) * MiB;
++        }
++        const uint64_t avail = meminfo("MemAvailable") + guard_held;
+         const uint64_t keep = std::max<uint64_t>(1024 * MiB, total / 10); // for the rest of the system
+         uint64_t mine = avail > keep ? avail - keep : 0;
+         const char * from = "free memory";
+@@ -253,6 +263,36 @@ struct corsia_experts {
+         return pool;
+     }
+ 
++    // Reads the weights every token uses before the pool fills, so they are in the page cache
++    // first. On a machine with uneven memory, where a guard holds the slow part during the
++    // load (membw guard), what is read first gets the fast memory: these weights are streamed
++    // whole for every token, the experts only 8 in 128. CORSIA_FIRST=0 turns it off.
++    void read_first(const char * path) const {
++        if (const char * e = std::getenv("CORSIA_FIRST"); e && std::strcmp(e, "0") == 0) {
++            return;
++        }
++        const int fd = open(path, O_RDONLY | O_CLOEXEC);
++        if (fd < 0) {
++            return;
++        }
++        std::vector<uint8_t> buf((size_t) 4 << 20);
++        uint64_t total = 0;
++        const auto t0 = std::chrono::steady_clock::now();
++        for (const auto & r : first_ranges) {
++            for (uint64_t at = 0; at < r.second;) {
++                const ssize_t n = pread(fd, buf.data(), (size_t) std::min<uint64_t>(buf.size(), r.second - at), (off_t) (r.first + at));
++                if (n <= 0) {
++                    break;
++                }
++                at += (uint64_t) n;
++                total += (uint64_t) n;
++            }
++        }
++        close(fd);
++        LOG_INF("corsia: read the %llu MiB every token uses first, in %.1f s\n", (unsigned long long) (total >> 20),
++            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++    }
++
+     bool map_experts(const char * path) {
+         ggml_context * meta = nullptr;
+         gguf_init_params p = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+@@ -296,6 +336,9 @@ struct corsia_experts {
+                 router_at(il).bias = data + gguf_get_tensor_offset(g, i);
+                 continue;
+             }
++            if (tt != nullptr && std::strstr(name, "_exps") == nullptr && std::strcmp(name, "token_embd.weight") != 0) {
++                first_ranges.push_back({ data + gguf_get_tensor_offset(g, i), ggml_nbytes(tt) });
++            }
+             if (std::sscanf(name, "blk.%d.ffn_%31[a-z_]", &il, kind) != 2 || il < 0 || tt == nullptr) {
+                 continue;
+             }
+@@ -832,6 +875,7 @@ inline void corsia_experts_install(const std::string & model_path, llama_context
+                     slices[il].push_back({ t.name, t.offs, t.stride });
+                 }
+             }
++            s->read_first(model_path.c_str());
+             auto p = std::make_unique<corsia_pool>();
+             int64_t experts = 0;
+             for (const auto & l : s->layers) {
+diff --git a/common/corsia-pool.h b/common/corsia-pool.h
+index 5a818c6..502b8be 100644
+--- a/common/corsia-pool.h
++++ b/common/corsia-pool.h
+@@ -208,16 +208,24 @@ struct corsia_pool {
+         if ((int64_t) ranked.size() > n_slots) {
+             ranked.resize(n_slots);
+         }
+-        // One read per layer, like a layer's own demand.
+-        const auto t0 = std::chrono::steady_clock::now();
+-        std::vector<std::vector<uint8_t>> want(layers.size(), std::vector<uint8_t>(n_expert, 0));
+-        for (auto & r : ranked) {
+-            want[r.second / n_expert][r.second % n_expert] = 1;
++        // One read per layer, like a layer's own demand. CORSIA_WARM_TIERS=N loads the most
++        // used Nth of the experts first, then the next: slots, and so memory, are handed out in
++        // load order, so with a guard holding the slow memory the most used experts get the fast.
++        int tiers = 1;
++        if (const char * e = std::getenv("CORSIA_WARM_TIERS")) {
++            tiers = std::max(1, std::min(16, std::atoi(e)));
+         }
++        const auto t0 = std::chrono::steady_clock::now();
+         const uint64_t before = loaded_bytes;
+-        for (size_t il = 0; il < layers.size(); il++) {
+-            if (std::find(want[il].begin(), want[il].end(), 1) != want[il].end()) {
+-                ensure((int) il, want[il], false);
++        for (int t = 0; t < tiers; t++) {
++            std::vector<std::vector<uint8_t>> want(layers.size(), std::vector<uint8_t>(n_expert, 0));
++            for (size_t i = ranked.size() * t / tiers; i < ranked.size() * (t + 1) / tiers; i++) {
++                want[ranked[i].second / n_expert][ranked[i].second % n_expert] = 1;
++            }
++            for (size_t il = 0; il < layers.size(); il++) {
++                if (std::find(want[il].begin(), want[il].end(), 1) != want[il].end()) {
++                    ensure((int) il, want[il], false);
++                }
+             }
+         }
+         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+-- 
+2.53.0
+

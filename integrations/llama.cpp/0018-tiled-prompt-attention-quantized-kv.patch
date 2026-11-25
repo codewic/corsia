@@ -1,0 +1,89 @@
+From aa9e479b4462fee92e29e1b65c9bc1fa0d7441f9 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:08:20 +0000
+Subject: [PATCH 3/3] corsia: tiled prompt attention over quantized KV caches
+
+---
+ ggml/src/ggml-cpu/ops.cpp | 33 ++++++++++++++++++++++++++++++---
+ 1 file changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 35c5577..ea33418 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9058,6 +9058,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+     }
+ }
+ 
++// Corsia: prompt attention over a quantized KV cache (q8_0 here) took the per-row path, where
++// every query row walks the whole cache on its own and converts each V row again: at 512 prompt
++// tokens a quarter of prompt time on testbox. The tiled path converts each 64-row tile of K and
++// V to f32 once and runs it against 64 query rows. CORSIA_FA_TILED_QUANT=0 keeps the old path.
++#define CORSIA_FA_MAX_D 1024
++static bool corsia_fa_tiled_quant(const ggml_tensor * k, const ggml_tensor * v) {
++    static const bool on = [] {
++        const char * e = getenv("CORSIA_FA_TILED_QUANT");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return on && k->type == v->type && ggml_is_quantized(k->type) &&
++        ggml_get_type_traits(k->type)->to_float != nullptr &&
++        k->ne[0] <= CORSIA_FA_MAX_D && v->ne[0] <= CORSIA_FA_MAX_D &&
++        k->ne[0] % ggml_blck_size(k->type) == 0 && v->ne[0] % ggml_blck_size(v->type) == 0;
++}
++
+ static void ggml_compute_forward_flash_attn_ext_tiled(
+         const ggml_compute_params * params,
+         ggml_tensor * dst,
+@@ -9103,6 +9119,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+ 
+     GGML_ASSERT(k->type == v->type);
+     const ggml_type kv_type = k->type;
++    ggml_to_float_t const kv_to_float = ggml_get_type_traits(kv_type)->to_float;
+ 
+ 
+     // broadcast factors
+@@ -9243,11 +9260,19 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+                     for (int64_t dk = 0; dk < DK; dk++) {
+                         K_f32[dk * KV_TILE_SZ + tk] = GGML_CPU_FP16_TO_FP32(k_f16[dk]);
+                     }
+-                } else {
++                } else if (kv_type == GGML_TYPE_F32) {
+                     const float * k_f32_src = (const float *)k_data;
+                     for (int64_t dk = 0; dk < DK; dk++) {
+                         K_f32[dk * KV_TILE_SZ + tk] = k_f32_src[dk];
+                     }
++                } else {
++                    // Corsia: a quantized cache (q8_0, q4_0, ...) is converted once per tile here
++                    // and shared by every query row of the tile
++                    float krow[CORSIA_FA_MAX_D];
++                    kv_to_float(k_data, krow, DK);
++                    for (int64_t dk = 0; dk < DK; dk++) {
++                        K_f32[dk * KV_TILE_SZ + tk] = krow[dk];
++                    }
+                 }
+             }
+             memset(KQ, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
+@@ -9305,8 +9330,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+                 const char * v_data = (const char *)v->data + kv_row(ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
+                 if (kv_type == GGML_TYPE_F16) {
+                     ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
+-                } else {
++                } else if (kv_type == GGML_TYPE_F32) {
+                     memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
++                } else {
++                    kv_to_float(v_data, V32 + tk * DV, DV);
+                 }
+             }
+             for (int tq = 0; tq < Q_TILE_SZ; tq++) {
+@@ -9686,7 +9713,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+         bool use_tiled = !use_ref &&
+                                (q->type == GGML_TYPE_F32 &&
+-                                kv_is_f32_or_f16 &&
++                                (kv_is_f32_or_f16 || corsia_fa_tiled_quant(k, v)) &&
+                                 k->type == v->type &&
+                                 neq1 >= Q_TILE_SZ);
+ #if defined(GGML_SIMD) && !defined(__x86_64__) && !defined(_M_X64)
+-- 
+2.53.0
+

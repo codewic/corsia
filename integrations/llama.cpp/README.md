@@ -2,11 +2,23 @@
 
 Patches for llama.cpp build b12283, applied in order: `0001` loads models through Corsia, `0002` streams experts for MoE models bigger than RAM, `0003` and `0004` guess the next layer's experts and fetch them ahead, `0005` records routing traces (`0007` keeps out the partial line the prompt pass used to leave), `0006` keeps the processor cool while it waits for experts, `0008` lets ggml's expert matmul take expert pointers from a table, and `0009` adds the expert pool (`CORSIA_POOL_MIB`, experts in memory Corsia fills directly, about twice as fast on prompts and 22 to 38% faster generating together with swapping), residency-aware routing (`CORSIA_SWAP`, on with the pool) and expert skipping (`CORSIA_SKIP`, off). `swap-quality.sh` measures how far a setting moves the output.
 
-The same changes live as commits on the `corsia` branch of our llama.cpp fork, which also carries `CORSIA.md` (every change, every setting, how to move to a newer release) and `scripts/corsia-build.sh` (the release build Corsia uses). The patches here are exported from that branch.
+The same changes live as commits on the `corsia` branch of our llama.cpp fork. Two files from that branch are here as they are: `CORSIA.md` (every change, every setting, how to move to a newer release) and `corsia-build.sh` (the release build Corsia uses; it goes in the fork's `scripts/`). The patches are exported from the branch without those two files, and the whole set is checked to apply in order with `git apply` on a clean b12283. There is no `0016` or `0024`: those two changes were to the build script alone.
 
 ## Running cool
 
 Streaming is limited by the drives, so the processor mostly waits, and by default it waits loudly: OpenMP keeps each waiting thread spinning at full power before it sleeps. With `CORSIA_SOCKET` set, patch `0006` makes waiting threads give up the core after a short spin (`CORSIA_COOL=0` turns it off; your own `OMP_WAIT_POLICY` or `GOMP_SPINCOUNT` always wins). Also leave `-t` alone: llama.cpp already uses one thread per physical core, and hyperthreads add heat to matrix work without adding speed. `stream-on-40gb.sh` reports the CPU seconds and package temperature of every arm, and takes `CPU_QUOTA=150%` for a hard ceiling.
+
+## Speed on the processor (0014 to 0021, 0023, 0027)
+
+The fork is built without OpenMP by default (`corsia-build.sh`): ggml's own thread pool decodes 15 to 23% faster on the i7-6700, and its waiting threads sleep at once under `CORSIA_COOL`. Prompt attention over the q8_0 cache Corsia uses now runs tiled (`0018`): each 64-row tile of the cache is converted once for 64 prompt tokens, so reading new tokens on top of a long conversation, the normal case for a coding agent, is about 3 times faster (`CORSIA_FA_TILED_QUANT=0` turns it off). `0015` does the same for single-token decode across the query heads that share a KV head, and `0014` sizes n-gram drafts by how well they have been doing. `CORSIA_OP_PROFILE=1` (`0017`) prints where graph time went, per op and weight, when the program exits. `0027` scores each cached K row once for all the query heads that share it (the same output, a little faster at long context on AVX2 processors). `0026` fixes `CORSIA_COOL=0`, which also turned weight repacking back on.
+
+Two more are in the fork switched off, because their speed is not measured yet: `0029` is a two-stage output layer (`CORSIA_HEAD_PREVIEW=4096`: a first pass over the high 2 bits of the Q6_K output matrix, then the best rows scored exactly; quality checked, KL divergence 0.00003 with the same top token every time) and `0028` holds fast memory for the KV cache during a load (`CORSIA_KV_FIRST=1`).
+
+## Loading (0022, 0025) and uneven memory
+
+With the pool on, the loader no longer prefetches the expert tensors (`0022`): the pool reads them straight from the drive, and prefetching them too read every expert twice on a cold start. The weights every token uses (attention, the output layer: under a gigabyte, but half of what a token reads) load first, and the pool can warm in tiers of use (`0025`).
+
+That order matters on machines whose memory modules differ in size: only the matched part runs dual-channel, so part of the memory reads at about half speed. `membw.c` here measures it without root (`local-agent.sh setup` runs it). When it is uneven, `local-agent.sh start` runs `membw guard` during the load: the guard takes the free memory, gives the fast part back and lets go of the slow part only as memory runs out, so the model fills the fast part first. On the test desktop (32 GB and 8 GB modules) decode went from 9.2 tok/s with the model in the slow part to 11.0 to 11.2 in the fast part.
 
 ## 0001: load through Corsia
 

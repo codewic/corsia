@@ -1,0 +1,86 @@
+From 82f25d70c6c0a48bbad5eac427e29dd8a7779ca1 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 12:04:51 +0000
+Subject: [PATCH 1/2] corsia: n-gram drafts earn their length
+
+---
+ common/speculative.cpp | 45 +++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 2ad6391..d753fb2 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2077,8 +2077,29 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+                 this->params.size_n, this->params.size_m, this->params.min_hits);
+     }
+ 
+-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+-        // noop
++    // Corsia: drafts earn their length. A wrong draft is verified as a batch, and on a CPU a
++    // mixture-of-experts model pays for every token in it (each pulls its own experts): with a
++    // fixed 48-token draft, an agent's thinking text (9 to 17% of drafts accepted) ran at 0.89
++    // tok/s against 2.9 without drafts. So a draft starts at 8 tokens, doubles after one that
++    // was accepted whole (up to size_m), and after a rejection drops to one more than what was
++    // accepted. Copy-heavy text grows back to long drafts in a few steps. CORSIA_DRAFT_ADAPT=0
++    // keeps the fixed size.
++    std::vector<size_t> draft_cap, draft_len; // per sequence
++    bool adapt = [] { const char * a = getenv("CORSIA_DRAFT_ADAPT"); return !(a && strcmp(a, "0") == 0); }();
++
++    void grow(llama_seq_id seq_id) {
++        if ((size_t) seq_id >= draft_cap.size()) {
++            draft_cap.resize(seq_id + 1, 8);
++            draft_len.resize(seq_id + 1, 0);
++            corpus_drafted.resize(seq_id + 1, 0);
++        }
++    }
++
++    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
++        if (seq_id >= 0) {
++            grow(seq_id);
++            draft_cap[seq_id] = 8;
++        }
+     }
+ 
+     bool process(const common_batch & /*batch*/) override {
+@@ -2096,9 +2117,7 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+             }
+ 
+             *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
+-            if ((size_t) seq_id >= corpus_drafted.size()) {
+-                corpus_drafted.resize(seq_id + 1, 0);
+-            }
++            grow(seq_id);
+             corpus_drafted[seq_id] = 0;
+             if (dp.result->empty()) {
+                 // nothing in the context: try the project (CORSIA_DRAFT_CORPUS, see corsia-corpus.h)
+@@ -2107,10 +2126,26 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+                     corpus_drafted[seq_id] = dp.result->size();
+                 }
+             }
++            if (adapt && dp.result->size() > draft_cap[seq_id]) {
++                dp.result->resize(draft_cap[seq_id]);
++                if (corpus_drafted[seq_id] > 0) {
++                    corpus_drafted[seq_id] = dp.result->size();
++                }
++            }
++            draft_len[seq_id] = dp.result->size();
+         }
+     }
+ 
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
++        if (seq_id >= 0 && (size_t) seq_id < draft_len.size() && draft_len[seq_id] > 0) {
++            size_t & cap = draft_cap[seq_id];
++            if (n_accepted >= draft_len[seq_id]) {
++                cap = std::min<size_t>(cap * 2, config.size_mgram);
++            } else {
++                cap = std::max<size_t>(1, (size_t) n_accepted + 1);
++            }
++            draft_len[seq_id] = 0;
++        }
+         // project drafts learn from their results (see corsia-corpus.h)
+         if (seq_id >= 0 && (size_t) seq_id < corpus_drafted.size() && corpus_drafted[seq_id] > 0) {
+             if (corsia_corpus * corpus = corsia_corpus::get()) {
+-- 
+2.53.0
+
