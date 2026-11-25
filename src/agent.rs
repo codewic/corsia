@@ -48,6 +48,8 @@ pub struct AgentArgs {
     volatile: Vec<String>,
     /// The project token file for the fork's drafts (CORSIA_DRAFT_CORPUS); None turns it off.
     corpus: Option<PathBuf>,
+    /// false: ask the model not to think (`enable_thinking: false`) unless the request says.
+    think: bool,
 }
 
 impl AgentArgs {
@@ -62,6 +64,7 @@ impl AgentArgs {
             log: None,
             volatile: vec![],
             corpus: std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/corsia/corpus/current.tok")),
+            think: true,
         };
         let mut it = args.iter();
         while let Some(x) = it.next() {
@@ -78,6 +81,13 @@ impl AgentArgs {
                 "--log" => a.log = Some(PathBuf::from(val("a file")?)),
                 "--volatile" => a.volatile.push(val("a line label, like \"Session id\"")?.to_lowercase()),
                 "--plain" => a.rewrite = false,
+                "--think" => {
+                    a.think = match val("on or off")?.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err("--think takes on or off.".into()),
+                    }
+                }
                 "--corpus" => {
                     let v = val("a file for the project's tokens, or off")?;
                     a.corpus = if v == "off" { None } else { Some(PathBuf::from(v)) };
@@ -376,6 +386,9 @@ pub fn run(args: &[String]) -> ExitCode {
         ),
         None => eprintln!("  Project drafts: off"),
     }
+    if !args.think {
+        eprintln!("  Thinking: off (each request asks the model to answer directly; --think on to allow it)");
+    }
     eprintln!("  Live status: http://127.0.0.1:{}/api/agent and /api/agent/events. Ctrl+C stops.", args.port);
     let corpus = args.corpus.clone().map(|f| Arc::new(crate::corpus::Corpus::new(f)));
     let state = Arc::new(State {
@@ -614,6 +627,9 @@ fn chat(stream: &mut TcpStream, state: &State, req: &Request) -> io::Result<()> 
     if let Some(c) = &state.corpus {
         c.notice(&body, &state.args.upstream); // before the rewrite moves the working directory
     }
+    if !state.args.think {
+        no_thinking(&mut body);
+    }
     let (key, prefix_chars) = if state.args.rewrite {
         let r = stabilise(&mut body, &state.args.volatile);
         rec.moved_chars = r.moved_chars;
@@ -739,6 +755,23 @@ fn chat(stream: &mut TcpStream, state: &State, req: &Request) -> io::Result<()> 
     }
     state.publish(rec);
     Ok(())
+}
+
+/// `--think off`: asks the model to answer without a thinking phase (chat templates that
+/// support it read `chat_template_kwargs.enable_thinking`), unless the request already chose.
+/// On the dev box a coding task took 118 s this way against more than 25 minutes with thinking,
+/// tests passing both times.
+fn no_thinking(body: &mut Value) {
+    let Value::Obj(fields) = body else { return };
+    match fields.iter_mut().find(|(k, _)| k == "chat_template_kwargs") {
+        Some((_, Value::Obj(kw))) => {
+            if !kw.iter().any(|(k, _)| k == "enable_thinking") {
+                kw.push(("enable_thinking".into(), Value::Bool(false)));
+            }
+        }
+        Some(_) => {}
+        None => fields.push(("chat_template_kwargs".into(), Value::Obj(vec![("enable_thinking".into(), Value::Bool(false))]))),
+    }
 }
 
 fn now_secs() -> f64 {
@@ -1284,6 +1317,16 @@ mod tests {
                 assert_eq!((t.cache_n, t.prompt_n, t.predicted_n), (5, 546, 16), "{stream}");
             }
         }
+    }
+
+    #[test]
+    fn think_off_asks_for_no_thinking_unless_the_request_chose() {
+        let mut v = json::parse("{\"messages\":[]}").unwrap();
+        no_thinking(&mut v);
+        assert_eq!(v.to_json(), "{\"messages\":[],\"chat_template_kwargs\":{\"enable_thinking\":false}}");
+        let mut keep = json::parse("{\"chat_template_kwargs\":{\"enable_thinking\":true}}").unwrap();
+        no_thinking(&mut keep);
+        assert_eq!(keep.to_json(), "{\"chat_template_kwargs\":{\"enable_thinking\":true}}");
     }
 
     #[test]

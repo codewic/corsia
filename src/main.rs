@@ -69,7 +69,7 @@ fn help() -> String {
 Usage:
   {BIN} agent [--upstream HOST:PORT] [--port N] [--slots N] [--snapshots DIR]
                [--min-snapshot-tokens N] [--volatile LABEL]... [--log FILE] [--plain]
-               [--corpus FILE|off]
+               [--corpus FILE|off] [--think on|off]
       OpenAI-compatible endpoint (http://127.0.0.1:7720/v1) in front of llama-server
       (default 127.0.0.1:8080) that makes coding assistants fast on a local model: moves
       the date, folder and git status out of the system prompt so its long prefix is
@@ -80,6 +80,7 @@ Usage:
       Project-wide drafts: the project the assistant names is tokenized into FILE
       (default ~/.cache/corsia/corpus/current.tok) for the fork's free n-gram drafts;
       give llama-server CORSIA_DRAFT_CORPUS=FILE and --spec-type ngram-simple.
+      --think off asks the model to answer without thinking (far fewer tokens per step).
 
   {BIN} serve MODEL --mount DIR [--copy-to DIR]... [--copy-gib N] [--cache-mib N]
                      [--copy-layout experts|file] [--copy-order TRACE]
