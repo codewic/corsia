@@ -1,0 +1,113 @@
+From 05e7b7a585a330f9dc73a4b778e084f8448bfcc0 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:07:51 +0000
+Subject: [PATCH 2/5] corsia: blocked softmax for grouped decode, opt-in
+
+---
+ ggml/src/ggml-cpu/ops.cpp | 76 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index ea33418..ea6e628 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9465,6 +9465,16 @@ static bool corsia_gqa_decode_on() {
+     return on;
+ }
+ 
++// Blocked softmax in the grouped decode, off by default (CORSIA_GQA_BLOCK=1 turns it on). The
++// row-by-row loop matches ggml's per-head loop exactly. The blocked one scores 64 rows, takes a
++// vectorised softmax per head and adds the V rows as one small matrix product: on Qwen3-30B-A3B
++// at 8,192 tokens of context 4.85 against 4.62 tok/s (+5%), but its KL divergence against an f16
++// cache was 0.0038 against 0.0025 (the vectorised exp is less exact), so it stays opt-in.
++static bool corsia_gqa_block_on() {
++    static const bool on = [] { const char * e = getenv("CORSIA_GQA_BLOCK"); return e && atoi(e) != 0; }();
++    return on;
++}
++
+ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_params * params, ggml_tensor * dst) {
+     const ggml_tensor * q    = dst->src[0];
+     const ggml_tensor * k    = dst->src[1];
+@@ -9506,7 +9516,8 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+     static thread_local std::vector<char>  qbuf;
+     static thread_local std::vector<float> fbuf;
+     qbuf.resize((size_t) R * q_row + 64);
+-    fbuf.resize((size_t) R * (DV + 2) + DV + 16);
++    constexpr int64_t BLK = 64;
++    fbuf.resize((size_t) R * (DV + 2) + DV + (size_t) R * BLK + (size_t) BLK * DV + 16);
+     float * VKQ = fbuf.data();               // [R][DV]
+     float * M   = VKQ + R*DV;                // [R]
+     float * S   = M + R;                     // [R]
+@@ -9531,6 +9542,69 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+             S[r] = 0.0f;
+         }
+         const int64_t ik2 = g, iv2 = g; // rk2 == rv2 == R
++        if (corsia_gqa_block_on()) {
++            // Blocks of BLK cache rows: score them for every head, then one vectorised softmax
++            // and one rescale per head and block, and the weighted sum of the block's V rows
++            // for all R heads as one small matrix product over V rows converted once.
++            float * W  = V32 + DV;           // [R][BLK] scores, then weights
++            float * VB = W + R*BLK;          // [BLK][DV] converted V rows
++            for (int64_t ic0 = 0; ic0 < nek1; ic0 += BLK) {
++                const int64_t nb_ = std::min<int64_t>(BLK, nek1 - ic0);
++                bool any = false;
++                for (int64_t r = 0; r < R; ++r) {
++                    float * w = W + r*BLK;
++                    for (int64_t b = 0; b < nb_; ++b) {
++                        const float mv = mp[r] ? slope[r]*GGML_CPU_FP16_TO_FP32(mp[r][ic0 + b]) : 0.0f;
++                        if (mv == -INFINITY) {
++                            w[b] = -INFINITY;
++                            continue;
++                        }
++                        float sv;
++                        kq_vec_dot(DK, &sv, 0, (const char *) k->data + ((ic0 + b)*nbk1 + ik2*nbk2), 0, qbuf.data() + r*q_row, 0, 1);
++                        sv = sv*scale;
++                        if (logit_softcap != 0.0f) {
++                            sv = logit_softcap*tanhf(sv);
++                        }
++                        w[b] = sv + mv;
++                        any = true;
++                    }
++                    for (int64_t b = nb_; b < BLK; ++b) {
++                        w[b] = -INFINITY;
++                    }
++                }
++                if (!any) {
++                    continue;
++                }
++                for (int64_t b = 0; b < nb_; ++b) {
++                    const char * v_data = (const char *) v->data + ((ic0 + b)*nbv1 + iv2*nbv2);
++                    if (v_to_float) {
++                        v_to_float(v_data, VB + b*DV, DV);
++                    } else {
++                        memcpy(VB + b*DV, v_data, DV*sizeof(float));
++                    }
++                }
++                if (nb_ < BLK) {
++                    memset(VB + nb_*DV, 0, (BLK - nb_)*DV*sizeof(float));
++                }
++                for (int64_t r = 0; r < R; ++r) {
++                    float * w = W + r*BLK;
++                    float bmax;
++                    ggml_vec_max_f32(BLK, &bmax, w);
++                    if (bmax == -INFINITY) {
++                        memset(w, 0, BLK*sizeof(float));
++                        continue;
++                    }
++                    if (bmax > M[r]) {
++                        const float ms = expf(M[r] - bmax);
++                        ggml_vec_scale_f32(DV, VKQ + r*DV, ms);
++                        S[r] *= ms;
++                        M[r] = bmax;
++                    }
++                    S[r] += (float) ggml_vec_soft_max_f32(BLK, w, w, M[r]);
++                }
++                simd_gemm(VKQ, W, VB, (int) R, (int) BLK, (int) DV);
++            }
++        } else
+         for (int64_t ic = 0; ic < nek1; ++ic) {
+             const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2);
+             bool any = false;
+-- 
+2.53.0
+

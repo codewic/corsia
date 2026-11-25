@@ -1,0 +1,147 @@
+From e73c86784a2aade7d230a3711033d2b9fbf79fbb Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:55:01 +0000
+Subject: [PATCH 4/5] corsia: grouped attention for 2 to 63 query tokens
+
+---
+ ggml/src/ggml-cpu/ops.cpp | 71 +++++++++++++++++++++++----------------
+ 1 file changed, 42 insertions(+), 29 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index ea6e628..caf047b 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9459,7 +9459,9 @@ static void ggml_flash_attn_ext_reduce_partials(
+ // single decoded token this walks each KV head once, scores every K row against all the query
+ // heads of its group and converts every V row once. Each head gets exactly the same operations
+ // in the same order as in the loop above, so the output is identical. CORSIA_GQA_DECODE=0 turns
+-// it off.
++// it off. It also takes 2 to 63 query tokens (n-gram draft checks, short tool results): those
++// went to the per-row loop, which reads the cache once per query head and token; here each KV
++// head is read once for all its heads and tokens, each with its own mask row.
+ static bool corsia_gqa_decode_on() {
+     static const bool on = [] { const char * e = getenv("CORSIA_GQA_DECODE"); return !(e && strcmp(e, "0") == 0); }();
+     return on;
+@@ -9493,6 +9495,10 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+     const int64_t DK = nek0;
+     const int64_t DV = nev0;
+     const int64_t R  = neq2/nek2; // query heads per KV head
++    const int64_t N  = neq1;      // query tokens
++    // work items: each KV head, split by tokens when there are more threads than KV heads
++    const int64_t nsplit = std::min<int64_t>(N, std::max<int64_t>(1, (params->nth + nek2 - 1)/nek2));
++    const int64_t NR = ((N + nsplit - 1)/nsplit)*R; // most (token, head) pairs in one item
+ 
+     float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
+     memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+@@ -9515,34 +9521,40 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+     // per thread: R quantized queries, R accumulators, one converted V row
+     static thread_local std::vector<char>  qbuf;
+     static thread_local std::vector<float> fbuf;
+-    qbuf.resize((size_t) R * q_row + 64);
++    qbuf.resize((size_t) NR * q_row + 64);
+     constexpr int64_t BLK = 64;
+-    fbuf.resize((size_t) R * (DV + 2) + DV + (size_t) R * BLK + (size_t) BLK * DV + 16);
+-    float * VKQ = fbuf.data();               // [R][DV]
+-    float * M   = VKQ + R*DV;                // [R]
+-    float * S   = M + R;                     // [R]
+-    float * V32 = S + R;                     // [DV]
+-    std::vector<float> slope(R), sc(R);
+-    std::vector<const ggml_fp16_t *> mp(R);
++    fbuf.resize((size_t) NR * (DV + 2) + DV + (size_t) R * BLK + (size_t) BLK * DV + 16);
++    float * VKQ = fbuf.data();               // [NR][DV]
++    float * M   = VKQ + NR*DV;               // [NR]
++    float * S   = M + NR;                    // [NR]
++    float * V32 = S + NR;                    // [DV]
++    std::vector<float> slope(NR), sc(NR);
++    std::vector<const ggml_fp16_t *> mp(NR);
+ 
+     const int ith = params->ith;
+     const int nth = params->nth;
+-    const int64_t iq1 = 0, iq3 = 0;
+-
+-    for (int64_t g = ith; g < nek2; g += nth) {
+-        for (int64_t r = 0; r < R; ++r) {
++    const int64_t iq3 = 0;
++
++    for (int64_t item = ith; item < nek2*nsplit; item += nth) {
++        const int64_t g  = item / nsplit;
++        const int64_t n0 = (item % nsplit)*N/nsplit;
++        const int64_t n1 = (item % nsplit + 1)*N/nsplit;
++        const int64_t J  = (n1 - n0)*R; // (token, head) pairs here, j = token*R + head
++        for (int64_t j = 0; j < J; ++j) {
++            const int64_t r   = j % R;
++            const int64_t iq1 = n0 + j / R;
+             const int64_t iq2 = g*R + r;
+             const uint32_t h = iq2;
+-            slope[r] = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
+-            mp[r] = mask ? (const ggml_fp16_t *)((const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
++            slope[j] = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
++            mp[j] = mask ? (const ggml_fp16_t *)((const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
+             const float * pq = (const float *) ((const char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
+-            q_to_vec_dot(pq, qbuf.data() + r*q_row, DK);
+-            memset(VKQ + r*DV, 0, DV*sizeof(float));
+-            M[r] = -INFINITY;
+-            S[r] = 0.0f;
++            q_to_vec_dot(pq, qbuf.data() + j*q_row, DK);
++            memset(VKQ + j*DV, 0, DV*sizeof(float));
++            M[j] = -INFINITY;
++            S[j] = 0.0f;
+         }
+         const int64_t ik2 = g, iv2 = g; // rk2 == rv2 == R
+-        if (corsia_gqa_block_on()) {
++        if (corsia_gqa_block_on() && J == R) { // one token: j is the head
+             // Blocks of BLK cache rows: score them for every head, then one vectorised softmax
+             // and one rescale per head and block, and the weighted sum of the block's V rows
+             // for all R heads as one small matrix product over V rows converted once.
+@@ -9608,7 +9620,7 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+         for (int64_t ic = 0; ic < nek1; ++ic) {
+             const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2);
+             bool any = false;
+-            for (int64_t r = 0; r < R; ++r) {
++            for (int64_t r = 0; r < J; ++r) {
+                 const float mv = mp[r] ? slope[r]*GGML_CPU_FP16_TO_FP32(mp[r][ic]) : 0.0f;
+                 if (mv == -INFINITY) {
+                     sc[r] = -INFINITY;
+@@ -9632,7 +9644,7 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+                 v_to_float(v_data, V32, DV);
+                 vrow = V32;
+             }
+-            for (int64_t r = 0; r < R; ++r) {
++            for (int64_t r = 0; r < J; ++r) {
+                 const float s = sc[r];
+                 if (s == -INFINITY) {
+                     continue;
+@@ -9651,12 +9663,13 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+                 S[r] = S[r]*ms + vs;
+             }
+         }
+-        for (int64_t r = 0; r < R; ++r) {
+-            float * acc = VKQ + r*DV;
+-            const float S_inv = S[r] == 0.0f ? 0.0f : 1.0f/S[r];
++        for (int64_t j = 0; j < J; ++j) {
++            float * acc = VKQ + j*DV;
++            const float S_inv = S[j] == 0.0f ? 0.0f : 1.0f/S[j];
+             ggml_vec_scale_f32(DV, acc, S_inv);
+-            const int64_t i2 = g*R + r;
+-            memcpy((char *) dst->data + (iq3*ne2*ne1 + i2 + iq1*ne1)*nb1, acc, nb1);
++            const int64_t i1 = n0 + j / R;
++            const int64_t i2 = g*R + j % R;
++            memcpy((char *) dst->data + (iq3*ne2*ne1 + i2 + i1*ne1)*nb1, acc, nb1);
+         }
+     }
+ }
+@@ -9714,9 +9727,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         const ggml_tensor * gk = dst->src[1];
+         const ggml_tensor * gv = dst->src[2];
+         if (dst->src[4] == nullptr && dst->src[5] == nullptr && gq->type == GGML_TYPE_F32 &&
+-            gq->ne[1] == 1 && gq->ne[3] == 1 && gk->ne[3] == 1 && gv->ne[3] == 1 &&
++            gq->ne[1] >= 1 && gq->ne[1] < (int64_t) ggml_fa_tile_config::Q && gq->ne[3] == 1 && gk->ne[3] == 1 && gv->ne[3] == 1 &&
+             gk->ne[2] == gv->ne[2] && gq->ne[2] > gk->ne[2] && gq->ne[2] % gk->ne[2] == 0 &&
+-            gk->ne[2] >= params->nth && gv->type != GGML_TYPE_F16 &&
++            gk->ne[2]*std::min<int64_t>(gq->ne[1], (params->nth + gk->ne[2] - 1)/gk->ne[2]) >= params->nth && gv->type != GGML_TYPE_F16 &&
+             gq->nb[0] == ggml_type_size(gq->type) && gk->nb[0] == ggml_type_size(gk->type) && gv->nb[0] == ggml_type_size(gv->type)) {
+             ggml_compute_forward_flash_attn_ext_gqa_decode(params, dst);
+             return;
+-- 
+2.53.0
+

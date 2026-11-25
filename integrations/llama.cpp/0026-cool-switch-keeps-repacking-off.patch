@@ -1,0 +1,50 @@
+From acb2a9a0f98487288144bcc2799993fbf37715e0 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:16:23 +0000
+Subject: [PATCH 1/4] corsia: CORSIA_COOL=0 no longer turns repacking back on
+
+---
+ common/arg.cpp          |  2 +-
+ common/corsia-threads.h | 10 +++++++++-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 5efa3db..34270f1 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1281,7 +1281,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
+             exit(0);
+         }
+         params.lr.init();
+-        if (corsia_streaming() && !corsia_has_openmp() &&
++        if (corsia_cool() && !corsia_has_openmp() &&
+             std::none_of(argv, argv + argc, [](const char * a) { return strcmp(a, "--poll") == 0; })) {
+             params.cpuparams.poll = 0; // llama.cpp's own thread pool: sleep while experts load
+             params.cpuparams_batch.poll = 0;
+diff --git a/common/corsia-threads.h b/common/corsia-threads.h
+index 033c524..141810e 100644
+--- a/common/corsia-threads.h
++++ b/common/corsia-threads.h
+@@ -37,10 +37,18 @@ static inline bool corsia_has_openmp() {
+ #endif
+ }
+ 
++// The model is streamed through Corsia. Not tied to CORSIA_COOL: other code asks this too
++// (weight repacking stays off while streaming), and CORSIA_COOL=0 once turned repacking
++// back on with it, which took the service past its memory cap.
+ static inline bool corsia_streaming() {
+     const char * sock = getenv("CORSIA_SOCKET");
++    return sock && *sock;
++}
++
++// Cool waiting applies: streaming, and not turned off with CORSIA_COOL=0.
++static inline bool corsia_cool() {
+     const char * cool = getenv("CORSIA_COOL");
+-    return sock && *sock && !(cool && strcmp(cool, "0") == 0);
++    return corsia_streaming() && !(cool && strcmp(cool, "0") == 0);
+ }
+ 
+ // Call first thing with main()'s argv. Returns only if the program carries on as it is.
+-- 
+2.53.0
+

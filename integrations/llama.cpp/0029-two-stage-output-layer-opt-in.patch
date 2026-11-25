@@ -1,0 +1,202 @@
+From 2a9c4c1360f9d305fa9b647ede672c396c1df05b Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:05:05 +0000
+Subject: [PATCH 4/4] corsia: two-stage output layer over Q6_K high bits, off
+ by default
+
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 171 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 171 insertions(+)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 426824a..346275f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1293,6 +1293,173 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     }
+ }
+ 
++// Corsia: two-stage output layer (CORSIA_HEAD_PREVIEW=N, 0 or unset: off).
++//
++// Every decoded token scores the whole vocabulary: 311 M weights in Qwen3-30B-A3B, a tenth of
++// what a token reads. Q6_K keeps each weight's low 4 bits and high 2 bits in separate arrays,
++// so a first pass reads the high bits alone (82 of every 210 bytes) and treats the low bits
++// as their middle value. On 1,627 real hidden states that preview never ranked the exact best
++// token below 133, the exact top 5 below 467 or the top 20 below 1,607. The second pass
++// scores the N best previewed rows exactly; the other rows keep their preview value.
++// The high bits are copied once into an array of their own: read in place they sit between
++// the low bits, the prefetcher pulls those through memory too, and the first pass then costs
++// as much as the whole matrix (measured: 16.4 ms either way on a memory-bound desktop).
++// One output compute at a time is assumed (the threshold is shared between the threads).
++static float corsia_head_thr;
++
++typedef struct {
++    uint8_t   qh[QK_K/4];
++    int8_t    scales[QK_K/16];
++    ggml_half d;
++} corsia_q6k_hi; // 82 bytes of the block's 210
++
++static corsia_q6k_hi * corsia_head_hi;
++static const void *    corsia_head_hi_of;
++
++static float corsia_q6k_high_dot(const corsia_q6k_hi * x, const block_q8_K * y, int nb) {
++#if defined(__AVX2__)
++    const __m256i m3 = _mm256_set1_epi8(3);
++    __m256 acc = _mm256_setzero_ps();
++    for (int i = 0; i < nb; i++) {
++        const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
++        const __m256i sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *) x[i].scales));
++        const __m256i sb = _mm256_madd_epi16(sc16, _mm256_loadu_si256((const __m256i *) y[i].bsums));
++        __m256i sumi = _mm256_setzero_si256();
++        for (int n = 0; n < 2; n++) {
++            const __m256i qh = _mm256_loadu_si256((const __m256i *) (x[i].qh + 32*n));
++            const int8_t * q8 = y[i].qs + 128*n;
++            const int8_t * sc = x[i].scales + 8*n;
++            for (int k = 0; k < 4; k++) {
++                const __m256i h = _mm256_and_si256(_mm256_srli_epi16(qh, 2*k), m3);
++                const __m256i p = _mm256_maddubs_epi16(h, _mm256_loadu_si256((const __m256i *) (q8 + 32*k)));
++                const __m256i s = _mm256_set_m128i(_mm_set1_epi16(sc[2*k + 1]), _mm_set1_epi16(sc[2*k]));
++                sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(p, s));
++            }
++        }
++        // weight = scale * (16*high - 24): 16 * sum(scale * high.x) - 24 * sum(scale * block sum)
++        const __m256i v = _mm256_sub_epi32(_mm256_slli_epi32(sumi, 4), _mm256_mullo_epi32(sb, _mm256_set1_epi32(24)));
++        acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(v)));
++    }
++    __m128 r = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
++    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
++    r = _mm_add_ss(r, _mm_movehdup_ps(r));
++    return _mm_cvtss_f32(r);
++#else
++    float sum = 0;
++    for (int i = 0; i < nb; i++) {
++        const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
++        int32_t sumi = 0, sb = 0;
++        for (int j = 0; j < 16; j++) {
++            sb += x[i].scales[j] * y[i].bsums[j];
++        }
++        for (int n = 0; n < 2; n++) {
++            const uint8_t * qh = x[i].qh + 32*n;
++            const int8_t * q8 = y[i].qs + 128*n;
++            const int8_t * sc = x[i].scales + 8*n;
++            for (int k = 0; k < 4; k++) {
++                int32_t a = 0, b = 0;
++                for (int l = 0; l < 16; l++) {
++                    a += ((qh[l]      >> (2*k)) & 3) * q8[32*k + l];
++                    b += ((qh[l + 16] >> (2*k)) & 3) * q8[32*k + 16 + l];
++                }
++                sumi += sc[2*k] * a + sc[2*k + 1] * b;
++            }
++        }
++        sum += d * (float) (16 * sumi - 24 * sb);
++    }
++    return sum;
++#endif
++}
++
++static bool corsia_head_preview(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
++    static int keep = -1;
++    if (keep < 0) {
++        const char * e = getenv("CORSIA_HEAD_PREVIEW");
++        keep = e ? atoi(e) : 0;
++    }
++    const struct ggml_tensor * w = dst->src[0];
++    const struct ggml_tensor * x = dst->src[1];
++    if (keep <= 0 || params->use_ref || w->type != GGML_TYPE_Q6_K || x->type != GGML_TYPE_F32 ||
++        w->ne[1] < 32768 || w->ne[1] <= 4 * (int64_t) keep || w->ne[0] % QK_K != 0 || w->ne[2] != 1 || w->ne[3] != 1 ||
++        x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[0] != w->ne[0] ||
++        strcmp(w->name, "output.weight") != 0 || params->wsize < ggml_row_size(GGML_TYPE_Q8_K, w->ne[0])) {
++        return false;
++    }
++    const int ith = params->ith, nth = params->nth;
++    const int64_t n_vocab = w->ne[1], n_embd = w->ne[0];
++    const int nb = (int) (n_embd / QK_K);
++    const size_t row = w->nb[1];
++    block_q8_K * y = (block_q8_K *) params->wdata;
++    float * out = (float *) dst->data;
++    if (ith == 0) {
++        type_traits_cpu[GGML_TYPE_Q8_K].from_float((const float *) x->data, y, n_embd);
++        if (corsia_head_hi_of != w->data) {
++            free(corsia_head_hi);
++            corsia_head_hi = malloc((size_t) n_vocab * nb * sizeof(corsia_q6k_hi));
++            for (int64_t r = 0; corsia_head_hi != NULL && r < n_vocab; r++) {
++                const block_q6_K * src = (const block_q6_K *) ((const char *) w->data + r * row);
++                for (int b = 0; b < nb; b++) {
++                    corsia_q6k_hi * hi = &corsia_head_hi[r * nb + b];
++                    memcpy(hi->qh, src[b].qh, sizeof hi->qh);
++                    memcpy(hi->scales, src[b].scales, sizeof hi->scales);
++                    hi->d = src[b].d;
++                }
++            }
++            corsia_head_hi_of = corsia_head_hi != NULL ? w->data : NULL;
++        }
++    }
++    ggml_barrier(params->threadpool);
++    const corsia_q6k_hi * hi = corsia_head_hi;
++    const int64_t r0 = n_vocab * ith / nth, r1 = n_vocab * (ith + 1) / nth;
++    if (hi == NULL) { // no memory for the copy: the plain exact pass
++        const ggml_vec_dot_t dot = type_traits_cpu[GGML_TYPE_Q6_K].vec_dot;
++        for (int64_t r = r0; r < r1; r++) {
++            dot((int) n_embd, &out[r], 0, (const char *) w->data + r * row, 0, y, 0, 1);
++        }
++        return true;
++    }
++    for (int64_t r = r0; r < r1; r++) {
++        out[r] = corsia_q6k_high_dot(hi + r * nb, y, nb);
++    }
++    ggml_barrier(params->threadpool);
++    if (ith == 0) {
++        // the preview value of about the keep-th best row, from a histogram
++        enum { BINS = 4096 };
++        static int32_t hist[BINS];
++        float lo = out[0], hi = out[0];
++        for (int64_t r = 1; r < n_vocab; r++) {
++            lo = out[r] < lo ? out[r] : lo;
++            hi = out[r] > hi ? out[r] : hi;
++        }
++        const float width = (hi - lo) / BINS;
++        float thr = lo;
++        if (width > 0) {
++            memset(hist, 0, sizeof hist);
++            const float inv = 1.0f / width;
++            for (int64_t r = 0; r < n_vocab; r++) {
++                int b = (int) ((out[r] - lo) * inv);
++                hist[b >= BINS ? BINS - 1 : b]++;
++            }
++            int64_t seen = 0;
++            int b = BINS - 1;
++            for (; b > 0 && seen + hist[b] < keep; b--) {
++                seen += hist[b];
++            }
++            thr = lo + width * b;
++        }
++        corsia_head_thr = thr;
++    }
++    ggml_barrier(params->threadpool);
++    const float thr = corsia_head_thr;
++    const ggml_vec_dot_t exact = type_traits_cpu[GGML_TYPE_Q6_K].vec_dot;
++    for (int64_t r = r0; r < r1; r++) {
++        if (out[r] >= thr) {
++            exact((int) n_embd, &out[r], 0, (const char *) w->data + r * row, 0, y, 0, 1);
++        }
++    }
++    return true;
++}
++
+ void ggml_compute_forward_mul_mat(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1306,6 +1473,10 @@ void ggml_compute_forward_mul_mat(
+         return;
+     }
+ 
++    if (corsia_head_preview(params, dst)) {
++        return;
++    }
++
+     // If tiled is supported, it will execute the full op here and we return
+     if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
+         return;
+-- 
+2.53.0
+

@@ -1,0 +1,121 @@
+From f28ca04b017c7ac28ebd214f2463fbbe3d1f975b Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:59:17 +0000
+Subject: [PATCH 2/4] corsia: one K row scored for all its query heads at once
+
+---
+ ggml/src/ggml-cpu/ops.cpp | 70 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 70 insertions(+)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index a31f2f9..a193c71 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9486,6 +9486,52 @@ static bool corsia_gqa_tiled_on() {
+     return on;
+ }
+ 
++// One K row of a q8_0 cache scored against all the queries of its group. The per-query dot
++// product loads the same K blocks, takes their absolute value and converts their scales once
++// per query head (8 times a row in Qwen3-30B-A3B); here that is done once per row. The
++// arithmetic and its order are those of ggml_vec_dot_q8_0_q8_0, so the scores are the same
++// bits. CORSIA_Q8_SCORES=0 keeps the per-query calls.
++#if defined(__AVX2__) && defined(__FMA__)
++#define CORSIA_Q8_SCORES_MAX_NB 16
++// the q8_0 block: a half-float scale and 32 quants (34 bytes, no padding)
++struct corsia_block_q8_0 {
++    ggml_fp16_t d;
++    int8_t      qs[32];
++};
++static_assert(sizeof(corsia_block_q8_0) == 34, "q8_0 block layout");
++static bool corsia_q8_scores_on() {
++    static const bool on = [] { const char * e = getenv("CORSIA_Q8_SCORES"); return !(e && strcmp(e, "0") == 0); }();
++    return on;
++}
++
++static inline void corsia_q8_0_scores(const corsia_block_q8_0 * k, int nb, const char * q, size_t q_row, const float * dq, int64_t n, float * out) {
++    __m256i kq[CORSIA_Q8_SCORES_MAX_NB], ak[CORSIA_Q8_SCORES_MAX_NB];
++    float dk[CORSIA_Q8_SCORES_MAX_NB];
++    for (int b = 0; b < nb; b++) {
++        kq[b] = _mm256_loadu_si256((const __m256i *) k[b].qs);
++        ak[b] = _mm256_sign_epi8(kq[b], kq[b]);
++        dk[b] = GGML_CPU_FP16_TO_FP32(k[b].d);
++    }
++    const __m256i ones = _mm256_set1_epi16(1);
++    for (int64_t r = 0; r < n; r++) {
++        const corsia_block_q8_0 * y = (const corsia_block_q8_0 *) (q + r*q_row);
++        const float * d = dq + r*nb;
++        __m256 acc = _mm256_setzero_ps();
++        for (int b = 0; b < nb; b++) {
++            const __m256i sy  = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) y[b].qs), kq[b]);
++            const __m256i dot = _mm256_maddubs_epi16(ak[b], sy);
++            const __m256  f   = _mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot));
++            acc = _mm256_fmadd_ps(_mm256_set1_ps(dk[b] * d[b]), f, acc);
++        }
++        __m128 res = _mm256_extractf128_ps(acc, 1);
++        res = _mm_add_ps(res, _mm256_castps256_ps128(acc));
++        res = _mm_add_ps(res, _mm_movehl_ps(res, res));
++        res = _mm_add_ss(res, _mm_movehdup_ps(res));
++        out[r] = _mm_cvtss_f32(res);
++    }
++}
++#endif
++
+ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_params * params, ggml_tensor * dst) {
+     const ggml_tensor * q    = dst->src[0];
+     const ggml_tensor * k    = dst->src[1];
+@@ -9539,6 +9585,12 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+     float * V32 = S + NR;                    // [DV]
+     std::vector<float> slope(NR), sc(NR);
+     std::vector<const ggml_fp16_t *> mp(NR);
++#ifdef CORSIA_Q8_SCORES_MAX_NB
++    const int  nb8    = (int) (DK / 32);
++    const bool use_q8 = corsia_q8_scores_on() && k->type == GGML_TYPE_Q8_0 && k_vec_dot_type == GGML_TYPE_Q8_0 &&
++                        DK % 32 == 0 && nb8 <= CORSIA_Q8_SCORES_MAX_NB;
++    std::vector<float> dq8(use_q8 ? (size_t) NR * nb8 : 0), raw8(use_q8 ? NR : 0);
++#endif
+ 
+     const int ith = params->ith;
+     const int nth = params->nth;
+@@ -9558,6 +9610,14 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+             mp[j] = mask ? (const ggml_fp16_t *)((const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
+             const float * pq = (const float *) ((const char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
+             q_to_vec_dot(pq, qbuf.data() + j*q_row, DK);
++#ifdef CORSIA_Q8_SCORES_MAX_NB
++            if (use_q8) {
++                const corsia_block_q8_0 * qb = (const corsia_block_q8_0 *) (qbuf.data() + j*q_row);
++                for (int b = 0; b < nb8; b++) {
++                    dq8[j*nb8 + b] = GGML_CPU_FP16_TO_FP32(qb[b].d);
++                }
++            }
++#endif
+             memset(VKQ + j*DV, 0, DV*sizeof(float));
+             M[j] = -INFINITY;
+             S[j] = 0.0f;
+@@ -9716,6 +9776,11 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+         for (int64_t ic = 0; ic < nek1; ++ic) {
+             const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2);
+             bool any = false;
++#ifdef CORSIA_Q8_SCORES_MAX_NB
++            if (use_q8) {
++                corsia_q8_0_scores((const corsia_block_q8_0 *) k_data, nb8, qbuf.data(), q_row, dq8.data(), J, raw8.data());
++            }
++#endif
+             for (int64_t r = 0; r < J; ++r) {
+                 const float mv = mp[r] ? slope[r]*GGML_CPU_FP16_TO_FP32(mp[r][ic]) : 0.0f;
+                 if (mv == -INFINITY) {
+@@ -9723,6 +9788,11 @@ static void ggml_compute_forward_flash_attn_ext_gqa_decode(const ggml_compute_pa
+                     continue;
+                 }
+                 float s;
++#ifdef CORSIA_Q8_SCORES_MAX_NB
++                if (use_q8) {
++                    s = raw8[r];
++                } else
++#endif
+                 kq_vec_dot(DK, &s, 0, k_data, 0, qbuf.data() + r*q_row, 0, 1);
+                 s = s*scale;
+                 if (logit_softcap != 0.0f) {
+-- 
+2.53.0
+
