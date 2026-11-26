@@ -70,7 +70,9 @@ CORSIA_BIN="${CORSIA_BIN:-$CORSIA/target/release/corsia}"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/.cache/corsia-build/llama.cpp/build-noomp/bin/llama-server}"
 [ -x "$LLAMA_SERVER" ] || LLAMA_SERVER="$HOME/.cache/corsia-build/llama.cpp/build/bin/llama-server"
 STATE="$HOME/.cache/corsia/local"
-KV="$HOME/.cache/corsia/kv"
+# prefix snapshots, one folder per model file (a cache computed by one model is no use to another);
+# the prefixes themselves (system prompts and tools) are kept for every model in kv/prefixes
+KV="$HOME/.cache/corsia/kv/$(basename "$MODEL" .gguf)"
 MNT="$STATE/mnt"
 UNIT=corsia-local
 DRAFTS="${DRAFTS:-auto}"

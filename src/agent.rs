@@ -401,6 +401,10 @@ pub fn run(args: &[String]) -> ExitCode {
         totals: Mutex::new((0, 0, 0)),
         live: Mutex::new(Vec::new()),
     });
+    if state.args.rewrite && state.args.snapshots.is_some() {
+        let st = state.clone();
+        std::thread::spawn(move || warm_prefixes(st));
+    }
     for stream in listener.incoming().flatten() {
         let state = state.clone();
         std::thread::spawn(move || {
@@ -737,6 +741,9 @@ fn chat(stream: &mut TcpStream, state: &State, req: &Request) -> io::Result<()> 
         }
         // First time this big prefix has been computed: keep its state on disk.
         let total = rec.cache_n + rec.prompt_n;
+        if big && total >= state.args.min_snapshot_tokens {
+            keep_prefix(state, key, &body);
+        }
         if let Some(dir) = &state.args.snapshots {
             let name = snapshot_name(key);
             if big && total >= state.args.min_snapshot_tokens && !dir.join(&name).is_file() {
@@ -771,6 +778,134 @@ fn no_thinking(body: &mut Value) {
         }
         Some(_) => {}
         None => fields.push(("chat_template_kwargs".into(), Value::Obj(vec![("enable_thinking".into(), Value::Bool(false))]))),
+    }
+}
+
+// Warm prefixes. A coding assistant's first request carries its whole system prompt and
+// tool list (5,000 to 23,000 tokens), and reading that on a CPU took 5 to 49 minutes in the
+// measurements. The snapshot only helps from the second time. So each big prefix is also kept
+// as text, in a library every model shares (`prefixes` beside the per-model snapshot folders),
+// and when the agent starts (after a restart or a model switch) it computes the newest ones
+// for the model now loaded and saves their snapshots before anyone asks. A request that comes
+// in meanwhile waits behind the warm-up on the same slot and reuses what it computed.
+
+fn prefix_dir(state: &State) -> Option<PathBuf> {
+    let snaps = state.args.snapshots.as_ref()?;
+    Some(snaps.parent().unwrap_or(snaps).join("prefixes"))
+}
+
+/// Keeps what makes up the stable prefix: the leading system messages, the tools and the
+/// template options. Written once per prefix.
+fn keep_prefix(state: &State, key: u64, body: &Value) {
+    let Some(dir) = prefix_dir(state) else { return };
+    let path = dir.join(format!("corsia-{key:016x}.json"));
+    if path.is_file() {
+        let _ = std::fs::OpenOptions::new().append(true).open(&path); // keep it recent
+        return;
+    }
+    let mut keep = Vec::new();
+    if let Some(msgs) = body.get("messages").and_then(Value::as_arr) {
+        let system: Vec<Value> = msgs.iter().take_while(|m| m.get("role").and_then(Value::as_str) == Some("system")).cloned().collect();
+        if system.is_empty() {
+            return;
+        }
+        keep.push(("messages".to_string(), Value::Arr(system)));
+    }
+    for k in ["tools", "chat_template_kwargs", "parallel_tool_calls"] {
+        if let Some(v) = body.get(k) {
+            keep.push((k.to_string(), v.clone()));
+        }
+    }
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(&path, Value::Obj(keep).to_json());
+    }
+}
+
+fn note(text: &str) {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = PathBuf::from(home).join(".cache/corsia/notes.log");
+    let now = std::process::Command::new("date").arg("+%H:%M").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}  {text}", now.trim());
+    }
+}
+
+fn progress(text: &str) {
+    if let Some(home) = std::env::var_os("HOME") {
+        let _ = std::fs::write(PathBuf::from(home).join(".cache/corsia/progress"), format!("{text}\n"));
+    }
+}
+
+/// At start: computes and saves the snapshots of the newest known prefixes (one per main
+/// slot) that the loaded model has none of yet.
+fn warm_prefixes(state: Arc<State>) {
+    let (Some(dir), Some(snaps)) = (prefix_dir(&state), state.args.snapshots.clone()) else { return };
+    // llama-server must be up; give a large model time to load
+    let t_wait = Instant::now();
+    while !matches!(upstream_get(&state.args.upstream, "/health"), Ok((200, _))) {
+        if t_wait.elapsed() > Duration::from_secs(1800) {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let mut known: Vec<(SystemTime, u64, PathBuf)> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let key = u64::from_str_radix(name.strip_prefix("corsia-")?.strip_suffix(".json")?, 16).ok()?;
+                    Some((e.metadata().ok()?.modified().ok()?, key, e.path()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    known.sort_by(|a, b| b.0.cmp(&a.0));
+    let main_slots = state.args.slots.saturating_sub(1).max(1);
+    for (_, key, path) in known.into_iter().take(main_slots) {
+        let name = snapshot_name(key);
+        if snaps.join(&name).is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(mut body) = json::parse(&text) else { continue };
+        // the slot is claimed first, so a request for this prefix queues behind the warm-up
+        let s = {
+            let mut slots = state.slots.lock().unwrap();
+            if slots.loaded.contains(&Some(key)) {
+                continue;
+            }
+            let n = slots.loaded.len();
+            let s = (0..n.saturating_sub(1).max(1)).min_by_key(|&i| (slots.loaded[i].is_some(), slots.last_used[i])).unwrap_or(0);
+            slots.loaded[s] = Some(key);
+            slots.last_used[s] = Instant::now();
+            s
+        };
+        if let Value::Obj(fields) = &mut body {
+            if let Some((_, Value::Arr(msgs))) = fields.iter_mut().find(|(k, _)| k == "messages") {
+                msgs.push(json::parse(r#"{"role":"user","content":"Hi"}"#).unwrap());
+            }
+        }
+        body.set("max_tokens", Value::num(1));
+        body.set("stream", Value::Bool(false));
+        body.set("id_slot", Value::num(s));
+        body.set("cache_prompt", Value::Bool(true));
+        if !state.args.think {
+            no_thinking(&mut body);
+        }
+        let t0 = Instant::now();
+        progress("warming the coding assistant's prompt for this model, so its first answer comes quickly");
+        note("Warming a coding assistant's prompt (system prompt and tools) for the model just started, so the first message does not wait for it.");
+        let ok = matches!(upstream_call(&state.args.upstream, "POST", "/v1/chat/completions", &body.to_json()), Ok((200, _)));
+        let saved = ok && slot_action(&state.args.upstream, s, "save", &name).is_ok();
+        let _ = std::fs::write(PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/corsia/progress"), "");
+        let tokens = slot_tokens(&state.args.upstream, s).unwrap_or(0);
+        if saved {
+            note(&format!("Assistant prompt warmed: {tokens} tokens in {:.0} s. The first message now reads only its own words.", t0.elapsed().as_secs_f64()));
+            eprintln!("{BIN} agent: warmed prefix {key:016x} into slot {s}: {tokens} tokens in {:.1} s", t0.elapsed().as_secs_f64());
+        } else {
+            state.slots.lock().unwrap().loaded[s] = None;
+            note("Warming the assistant's prompt did not finish; the first message will read it instead.");
+        }
     }
 }
 
