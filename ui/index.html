@@ -151,8 +151,8 @@ main { max-width: 1240px; margin: 0 auto; padding: 16px 16px 48px; }
 .now.quiet { background: var(--warn-fill); }
 .now .what { flex: 1; min-width: 0; }
 .now .meter { width: 100px; margin: 0; flex: none; }
-.notes { list-style: none; margin: 0; padding: 0; max-height: 340px; overflow: auto; }
-.notes li { display: grid; grid-template-columns: 44px 1fr; gap: 8px; padding: 6px 0; font-size: 13px; border-top: 1px solid var(--line); }
+.notes { list-style: none; margin: 0; padding: 0; max-height: 340px; overflow-y: auto; overflow-x: hidden; }
+.notes li { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 8px; padding: 6px 0; font-size: 13px; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
 .notes li:first-child { border-top: 0; }
 .notes .t { color: var(--faint); }
 
@@ -366,7 +366,7 @@ function spark(svg, values, top) {
   const max = top || Math.max(...values) * 1.15 || 1;
   const step = values.length > 1 ? w / (values.length - 1) : 0;
   const pts = values.map((v, i) => [values.length > 1 ? i * step : w, h - 3 - (v / max) * (h - 8)]);
-  if (pts.length === 1) pts.unshift([0, pts[0][1]]);
+  if (pts.length === 1) { svg.innerHTML = `<line class="base" x1="0" y1="${h - 1}" x2="${w}" y2="${h - 1}"/><circle cx="${w - 4}" cy="${pts[0][1].toFixed(1)}" r="3" fill="var(--accent)" vector-effect="non-scaling-stroke"/>`; return; }
   const line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
   svg.innerHTML = `<line class="base" x1="0" y1="${h - 1}" x2="${w}" y2="${h - 1}"/><path class="area" d="${line} L${pts[pts.length - 1][0]} ${h} L${pts[0][0]} ${h} Z"/><path class="line" d="${line}"/>`;
 }
@@ -376,10 +376,11 @@ function renderSpeed() {
   if (r) {
     $("s-write").innerHTML = `${r.write.toFixed(1)}<small>tok/s</small>`;
     $("s-read").innerHTML = r.read ? `${r.read.toFixed(0)}<small>tok/s</small>` : `<span class="none">all reused</span>`;
-    $("s-meta").textContent = `${r.tokens} tokens written · ${r.prompt} new and ${r.reused} reused prompt tokens · ${S.speeds.length} recent requests`;
+    $("s-meta").textContent = `${r.tokens} tokens written · ${r.prompt} new and ${r.reused} reused prompt tokens · ${S.speeds.length} recent request${S.speeds.length === 1 ? "" : "s"}`;
+    $("s-read").parentElement.hidden = false;
   } else {
-    $("s-write").innerHTML = `<span class="none">no requests yet</span>`;
-    $("s-read").innerHTML = `<span class="none">no requests yet</span>`;
+    $("s-write").innerHTML = `<span class="none">No requests yet</span>`;
+    $("s-read").parentElement.hidden = true;
     $("s-meta").textContent = "Requests from VS Code and the chat show here as they finish.";
   }
   spark($("s-spark"), S.speeds.slice(-40));
