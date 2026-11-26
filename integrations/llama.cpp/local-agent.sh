@@ -5,7 +5,9 @@
 # reusable (stable prefix, slots, KV snapshots on disk). All three run as one systemd user
 # service under a memory cap, so the rest of the machine keeps its memory.
 #
-# Usage:  integrations/llama.cpp/local-agent.sh setup | start | stop | status | logs
+# Usage:  integrations/llama.cpp/local-agent.sh setup | models | use N | start | stop | status | logs
+#   models            the models in ~/models, numbered, with their size and whether they fit in memory
+#   use N|NAME        switch to one of them (stops the one running); start uses it from then on
 #   setup             run once per machine and model: checks the processor, memory and drive,
 #                     builds what is missing, writes the copy of the model tuned to this CPU
 #                     (TUNE=0 skips it) and saves what it found in ~/.config/corsia/machine.env
@@ -28,6 +30,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CORSIA="$(cd "$HERE/../.." && pwd)"
 CAP="${CAP:-auto}"
+# The models to choose from (`models`, `use`): ~/models, or ~/models/gguf when that is where they are
+MODELS_DIR="${MODELS_DIR:-$HOME/models}"
+[ -d "$MODELS_DIR" ] || MODELS_DIR="$HOME/models/gguf"
+CHOSEN="$HOME/.config/corsia/model"
+# the model: MODEL=, else the last one picked with `use`, else the first 30B found
+if [ -z "${MODEL:-}" ] && [ -s "$CHOSEN" ] && [ -f "$(cat "$CHOSEN")" ]; then MODEL="$(cat "$CHOSEN")"; fi
 MODEL="${MODEL:-$HOME/models/gguf/Qwen3-30B-A3B-UD-Q2_K_XL.gguf}"
 BASE_MODEL="$MODEL"
 # a copy tuned to this CPU by cpu-tune.sh, when there is one, is used instead
@@ -161,7 +169,51 @@ setup() {
   echo "Saved in $PROFILE. Start with: $0 start"
 }
 
+# The models in MODELS_DIR, numbered for `use`: one file each (split parts and the -cpu.gguf
+# copies the tuner writes are left out; a tuned copy is used on its own when it is there).
+model_files() {
+  find "$MODELS_DIR" -maxdepth 1 -name '*.gguf' ! -name '*-cpu.gguf' ! -name '*-0000?-of-0000?.gguf' -printf '%f\n' 2>/dev/null | sort
+}
+
+models() {
+  local i=0 f size need fits mark state running="" total
+  total="$(gib MemTotal)"
+  systemctl --user is-active --quiet "$UNIT" && running="$(cat "$CHOSEN" 2>/dev/null || true)"
+  echo "Models in $MODELS_DIR (switch with: $0 use NUMBER):"
+  while IFS= read -r f; do
+    i=$((i + 1))
+    size=$(( ($(stat -c %s "$MODELS_DIR/$f") + 1073741823) >> 30 ))
+    need=$(( size + 3 ))
+    if [ "$need" -le $(( total * 9 / 10 )) ]; then fits="fits in memory"; else fits="streams experts from the drive"; fi
+    mark="  "; state=""
+    if [ "$MODELS_DIR/$f" = "$running" ]; then mark="▸ "; state=", running"; fi
+    printf '%s%2d  %-62s %4d GiB  %s%s\n' "$mark" "$i" "$f" "$size" "$fits" "$state"
+  done < <(model_files)
+  [ "$i" -gt 0 ] || echo "  none (put .gguf files there, or set MODELS_DIR)"
+}
+
+# `use 3` or `use coder`: remember the model, stop the one running and start it
+use_model() {
+  local want="${1:-}" f="" n
+  [ -n "$want" ] || die "use NUMBER or part of a name (see: $0 models)"
+  if [[ "$want" =~ ^[0-9]+$ ]]; then
+    f="$(model_files | sed -n "${want}p")"
+  else
+    n="$(model_files | grep -ic -- "$want" || true)"
+    [ "$n" -le 1 ] || die "\"$want\" matches $n models; be more exact (see: $0 models)"
+    f="$(model_files | grep -i -m1 -- "$want" || true)"
+  fi
+  [ -n "$f" ] || die "no model \"$want\" (see: $0 models)"
+  mkdir -p "$(dirname "$CHOSEN")"
+  echo "$MODELS_DIR/$f" > "$CHOSEN"
+  echo "Switching to $f"
+  "$0" stop >/dev/null
+  MODEL="$MODELS_DIR/$f" exec "$0" start
+}
+
 case "${1:-status}" in
+  models) models ;;
+  use) use_model "${2:-}" ;;
   start)
     if systemctl --user is-active --quiet "$UNIT"; then status; exit 0; fi
     [ -f "$MODEL" ] || die "no model at $MODEL"
@@ -254,5 +306,5 @@ case "${1:-status}" in
   status) status ;;
   setup) setup ;;
   logs) tail -n 20 "$STATE/serve.log" "$STATE/llama-server.log" "$STATE/agent.log" 2>/dev/null ;;
-  *) die "usage: $0 setup | start | stop | status | logs" ;;
+  *) die "usage: $0 setup | models | use N | start | stop | status | logs" ;;
 esac
