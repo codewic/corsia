@@ -282,7 +282,8 @@ pub fn draw(f: &mut Frame, store: &Store, daemon: &Daemon, model: Option<&Model>
         Some(_) => 2,
         None => 0,
     };
-    let notes_h = if daemon.notes.is_empty() { 0 } else { (daemon.notes.len() as u16 + 1).min(area.height.saturating_sub(panel_h + model_h + 10)) };
+    let note_rows = note_lines(&daemon.notes, area.width as usize, th).len() as u16;
+    let notes_h = if daemon.notes.is_empty() { 0 } else { (note_rows + 1).min(14).min(area.height.saturating_sub(panel_h + model_h + 10)) };
     let [header, _, body, _, mpanel, _, npanel, _, panel, _, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -329,16 +330,51 @@ fn draw_notes(f: &mut Frame, area: Rect, d: &Daemon, th: &Theme) {
     if area.height == 0 {
         return;
     }
-    let w = area.width as usize;
     let mut out = vec![Line::from(vec![Span::styled("Notes", bold(th.text)), Span::styled("  what is being done on this machine", s(th.muted))])];
+    let lines = note_lines(&d.notes, area.width as usize, th);
     let room = area.height.saturating_sub(1) as usize;
-    let start = d.notes.len().saturating_sub(room);
-    for n in &d.notes[start..] {
-        let (time, text) = n.split_once("  ").unwrap_or(("", n.as_str()));
-        let text: String = text.chars().take(w.saturating_sub(time.len() + 2)).collect();
-        out.push(Line::from(vec![Span::styled(format!("{time}  "), s(th.faint)), Span::styled(text, s(th.text))]));
-    }
+    out.extend(lines.into_iter().rev().take(room).collect::<Vec<_>>().into_iter().rev());
     f.render_widget(Paragraph::new(out), area);
+}
+
+/// The notes as screen lines: each wrapped at word boundaries to the width, the time on its
+/// first line and the rest indented under the text.
+fn note_lines(notes: &[String], width: usize, th: &Theme) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for n in notes {
+        let (time, text) = n.split_once("  ").unwrap_or(("", n.as_str()));
+        let lead = if time.is_empty() { 0 } else { time.chars().count() + 2 };
+        let room = width.saturating_sub(lead).max(10);
+        let mut rows: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for word in text.split_whitespace() {
+            let mut word = word.to_string();
+            while word.chars().count() > room {
+                if !cur.is_empty() {
+                    rows.push(std::mem::take(&mut cur));
+                }
+                let head: String = word.chars().take(room).collect();
+                word = word.chars().skip(room).collect();
+                rows.push(head);
+            }
+            let need = if cur.is_empty() { word.chars().count() } else { cur.chars().count() + 1 + word.chars().count() };
+            if need > room && !cur.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(&word);
+        }
+        if !cur.is_empty() || rows.is_empty() {
+            rows.push(cur);
+        }
+        for (i, row) in rows.into_iter().enumerate() {
+            let prefix = if i == 0 && lead > 0 { format!("{time}  ") } else { " ".repeat(lead) };
+            out.push(Line::from(vec![Span::styled(prefix, s(th.faint)), Span::styled(row, s(th.text))]));
+        }
+    }
+    out
 }
 
 /// What the model is writing: its thinking (dim) and its answer, the latest lines.
