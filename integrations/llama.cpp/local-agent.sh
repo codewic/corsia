@@ -327,7 +327,10 @@ case "${1:-status}" in
         if [ "$PROJECT_DRAFTS" = 1 ]; then corpus_env="$CORPUS"; corpus_arg=(--corpus "$CORPUS"); fi
         think_arg=(--think off); [ "$THINK" = 1 ] && think_arg=(--think on)
         threads_arg=(); [ -n "$THREADS" ] && threads_arg=(-t "$THREADS")
-        CORSIA_SOCKET="$sock" CORSIA_DRAFT_CORPUS="$corpus_env" "$LLAMA_SERVER" -m "$MNT/$(basename "$MODEL")" --alias local "${spec[@]}" "${threads_arg[@]}" \
+        # the model'"'"'s own name, so the chat page and /v1/models show it; with one model loaded
+        # llama-server answers whatever name a client sends, so assistants set to "local" still work
+        name="$(basename "$MODEL" .gguf)"; name="${name%-cpu}"
+        CORSIA_SOCKET="$sock" CORSIA_DRAFT_CORPUS="$corpus_env" "$LLAMA_SERVER" -m "$MNT/$(basename "$MODEL")" --alias "$name" "${spec[@]}" "${threads_arg[@]}" \
           -c "$CTX" -np 2 --kv-unified -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 -cram 0 \
           --slot-save-path "$KV" --jinja --no-warmup --port "$LLAMA_PORT" > "$STATE/llama-server.log" 2>&1 &
         until curl -sf "http://127.0.0.1:$LLAMA_PORT/health" >/dev/null; do sleep 2; done
