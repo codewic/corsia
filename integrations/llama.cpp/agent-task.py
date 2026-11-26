@@ -70,7 +70,9 @@ TOOLS = [
 
 
 def run_tests(root):
-    p = subprocess.run([sys.executable, "-I", "test_intervals.py"], cwd=root, capture_output=True, text=True, timeout=60)
+    # -E -s rather than -I: isolated mode also drops the script's own folder from the path,
+    # and the tests import the module beside them
+    p = subprocess.run([sys.executable, "-E", "-s", "test_intervals.py"], cwd=root, capture_output=True, text=True, timeout=60)
     return p.returncode == 0, (p.stdout + p.stderr)[-2000:]
 
 
