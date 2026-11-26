@@ -1,0 +1,147 @@
+From 22b550b5b4c95d2a31c04b08e57965bc7f3d8592 Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:46:00 +0000
+Subject: [PATCH] Two-stage output layer for Q8_0 matrices: a 4-bit first pass
+ on the Q4_0 kernel
+
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 113 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 110 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 2872e9f..883faf2 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1430,6 +1430,107 @@ static float corsia_q6k_high_dot(const corsia_q6k_hi * x, const block_q8_K * y,
+ #endif
+ }
+ 
++// The preview value of about the keep-th best row, from a histogram of the first pass.
++static float corsia_head_threshold(const float * out, int64_t n_vocab, int keep) {
++    enum { BINS = 4096 };
++    static int32_t hist[BINS];
++    float lo = out[0], hi = out[0];
++    for (int64_t r = 1; r < n_vocab; r++) {
++        lo = out[r] < lo ? out[r] : lo;
++        hi = out[r] > hi ? out[r] : hi;
++    }
++    const float width = (hi - lo) / BINS;
++    if (!(width > 0)) {
++        return lo;
++    }
++    memset(hist, 0, sizeof hist);
++    const float inv = 1.0f / width;
++    for (int64_t r = 0; r < n_vocab; r++) {
++        int b = (int) ((out[r] - lo) * inv);
++        hist[b >= BINS ? BINS - 1 : b]++;
++    }
++    int64_t seen = 0;
++    int b = BINS - 1;
++    for (; b > 0 && seen + hist[b] < keep; b--) {
++        seen += hist[b];
++    }
++    return lo + width * b;
++}
++
++// Two-stage output layer for a Q8_0 matrix (gpt-oss's 201,088 x 2,880 is 615 MB a token). A
++// 4-bit copy is made once, in Q4_0's own layout so the first pass runs on ggml's fast Q4_0
++// kernel: each weight's int8 rounded to its top 4 bits, the block scale times 16 (330 MB,
++// 0.53 of the bytes). The best rows are then scored exactly from the Q8_0 matrix.
++static block_q4_0 * corsia_head_q4;
++static const void * corsia_head_q4_of;
++
++static bool corsia_head_preview_q80(const struct ggml_compute_params * params, struct ggml_tensor * dst, int keep) {
++    const struct ggml_tensor * w = dst->src[0];
++    const struct ggml_tensor * x = dst->src[1];
++    const int ith = params->ith, nth = params->nth;
++    const int64_t n_vocab = w->ne[1], n_embd = w->ne[0];
++    const int nb = (int) (n_embd / QK8_0);
++    const size_t row = w->nb[1], row4 = (size_t) nb * sizeof(block_q4_0);
++    block_q8_0 * y = (block_q8_0 *) params->wdata;
++    float * out = (float *) dst->data;
++    // the copy is made on the first call, every thread converting its own rows
++    static bool building = false;
++    if (ith == 0) {
++        type_traits_cpu[GGML_TYPE_Q8_0].from_float((const float *) x->data, y, n_embd);
++        building = corsia_head_q4_of != w->data;
++        if (building) {
++            free(corsia_head_q4);
++            corsia_head_q4 = malloc((size_t) n_vocab * row4);
++        }
++    }
++    ggml_barrier(params->threadpool);
++    const int64_t r0 = n_vocab * ith / nth, r1 = n_vocab * (ith + 1) / nth;
++    if (building && corsia_head_q4 != NULL) {
++        for (int64_t r = r0; r < r1; r++) {
++            const block_q8_0 * src = (const block_q8_0 *) ((const char *) w->data + r * row);
++            block_q4_0 * q4 = corsia_head_q4 + r * nb;
++            for (int b = 0; b < nb; b++) {
++                q4[b].d = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(src[b].d) * 16.0f);
++                for (int j = 0; j < QK8_0 / 2; j++) {
++                    int lo = (src[b].qs[j] + 8) >> 4, hi = (src[b].qs[j + QK8_0 / 2] + 8) >> 4;
++                    lo = lo < -8 ? -8 : lo > 7 ? 7 : lo;
++                    hi = hi < -8 ? -8 : hi > 7 ? 7 : hi;
++                    q4[b].qs[j] = (uint8_t) ((lo + 8) | ((hi + 8) << 4));
++                }
++            }
++        }
++        ggml_barrier(params->threadpool);
++        if (ith == 0) {
++            corsia_head_q4_of = w->data;
++        }
++    } else if (building && ith == 0) {
++        corsia_head_q4_of = NULL;
++    }
++    const ggml_vec_dot_t exact = type_traits_cpu[GGML_TYPE_Q8_0].vec_dot;
++    if (corsia_head_q4 == NULL) { // no memory for the copy: the plain exact pass
++        for (int64_t r = r0; r < r1; r++) {
++            exact((int) n_embd, &out[r], 0, (const char *) w->data + r * row, 0, y, 0, 1);
++        }
++        return true;
++    }
++    const ggml_vec_dot_t preview = type_traits_cpu[GGML_TYPE_Q4_0].vec_dot;
++    for (int64_t r = r0; r < r1; r++) {
++        preview((int) n_embd, &out[r], 0, corsia_head_q4 + r * nb, 0, y, 0, 1);
++    }
++    ggml_barrier(params->threadpool);
++    if (ith == 0) {
++        corsia_head_thr = corsia_head_threshold(out, n_vocab, keep);
++    }
++    ggml_barrier(params->threadpool);
++    const float thr = corsia_head_thr;
++    for (int64_t r = r0; r < r1; r++) {
++        if (out[r] >= thr) {
++            exact((int) n_embd, &out[r], 0, (const char *) w->data + r * row, 0, y, 0, 1);
++        }
++    }
++    return true;
++}
++
+ static bool corsia_head_preview(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+     static int keep = -1;
+     if (keep < 0) {
+@@ -1442,12 +1543,18 @@ static bool corsia_head_preview(const struct ggml_compute_params * params, struc
+     }
+     const struct ggml_tensor * w = dst->src[0];
+     const struct ggml_tensor * x = dst->src[1];
+-    if (keep <= 0 || params->use_ref || w->type != GGML_TYPE_Q6_K || x->type != GGML_TYPE_F32 ||
+-        w->ne[1] < 32768 || w->ne[1] <= 4 * (int64_t) keep || w->ne[0] % QK_K != 0 || w->ne[2] != 1 || w->ne[3] != 1 ||
++    // Q6_K previews from its high bits in place; Q8_0 (gpt-oss, rows 2,880 wide, which Q6_K
++    // cannot hold) from a 4-bit copy made once (see corsia_head_preview_q80)
++    const bool q80 = w->type == GGML_TYPE_Q8_0;
++    if (keep <= 0 || params->use_ref || (w->type != GGML_TYPE_Q6_K && !q80) || x->type != GGML_TYPE_F32 ||
++        w->ne[1] < 32768 || w->ne[1] <= 4 * (int64_t) keep || w->ne[0] % (q80 ? QK8_0 : QK_K) != 0 || w->ne[2] != 1 || w->ne[3] != 1 ||
+         x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[0] != w->ne[0] ||
+-        strcmp(w->name, "output.weight") != 0 || params->wsize < ggml_row_size(GGML_TYPE_Q8_K, w->ne[0])) {
++        strcmp(w->name, "output.weight") != 0 || params->wsize < ggml_row_size(q80 ? GGML_TYPE_Q8_0 : GGML_TYPE_Q8_K, w->ne[0])) {
+         return false;
+     }
++    if (q80) {
++        return corsia_head_preview_q80(params, dst, keep);
++    }
+     const int ith = params->ith, nth = params->nth;
+     const int64_t n_vocab = w->ne[1], n_embd = w->ne[0];
+     const int nb = (int) (n_embd / QK_K);
+-- 
+2.53.0
+

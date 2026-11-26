@@ -17,8 +17,10 @@
 #                     -cpu.gguf copy from cpu-tune.sh when there is one)
 #   CTX=32768         context shared by the two slots (default 32768)
 #   PORT=7720         the endpoint: point the assistant at http://127.0.0.1:PORT/v1
-#   DRAFTS=1          free n-gram drafts (on: +28% on copy-heavy answers at 10 GiB, nothing lost
-#                     on fresh writing); 0 turns them off
+#   DRAFTS=auto       free n-gram drafts, chosen per model: on when the model streams experts from
+#                     the drive (+28% on copy-heavy answers at 10 GiB, nothing lost on fresh writing),
+#                     off when it fits in memory and the processor is the limit (a rejected draft is
+#                     wasted arithmetic: an agent task took 215 s with them, 159 s without); 1 or 0 forces it
 #   PROJECT_DRAFTS=0  1 also drafts from the project's files (corsia agent --corpus), experimental
 #   THREADS=N         compute threads (default: llama.cpp's own choice, one per physical core;
 #                     on a virtual machine try the number of real cores behind it)
@@ -54,7 +56,7 @@ STATE="$HOME/.cache/corsia/local"
 KV="$HOME/.cache/corsia/kv"
 MNT="$STATE/mnt"
 UNIT=corsia-local
-DRAFTS="${DRAFTS:-1}"
+DRAFTS="${DRAFTS:-auto}"
 PROJECT_DRAFTS="${PROJECT_DRAFTS:-0}"
 THINK="${THINK:-0}"
 THREADS="${THREADS:-}"
@@ -169,6 +171,40 @@ setup() {
   echo "Saved in $PROFILE. Start with: $0 start"
 }
 
+# Every model is tuned to this processor once, without anyone running setup: after a start,
+# cpu-tune.sh times each format at the model's own shape and writes a -cpu.gguf copy when a
+# faster format holds at least the same precision; the next start uses that copy. It runs
+# at low priority beside the model and posts what it did to the notes. TUNE=0 turns it off.
+auto_tune() {
+  local base="$BASE_MODEL" name mark free_gib need
+  name="$(basename "$base")"
+  mark="$HOME/.config/corsia/tuned/$name"
+  [ "${TUNE:-1}" != 0 ] || return 0
+  [ ! -f "$mark" ] && [ ! -f "${base%.gguf}-cpu.gguf" ] || return 0
+  { [ -x "$FORK/build/bin/test-backend-ops" ] || [ -x "$FORK/build-noomp/bin/test-backend-ops" ]; } || return 0
+  free_gib="$(df --output=avail -B1G "$(dirname "$base")" | tail -1 | tr -d ' ')"
+  need=$(( ($(stat -c %s "$base") >> 30) * 14 / 10 + 2 ))
+  [ "$free_gib" -ge "$need" ] || return 0
+  mkdir -p "$(dirname "$mark")"
+  systemd-run --user --unit "corsia-tune-$(date +%s)" --collect --quiet -p Nice=15 -p IOSchedulingClass=idle \
+    --expand-environment=no env BASE="$base" NAME="$name" MARK="$mark" TUNER="$HERE/cpu-tune.sh" WORK="$(dirname "$FORK")" LOG="$STATE/tune.log" bash -c '
+      note() { echo "$(date +%H:%M)  $*" >> ~/.cache/corsia/notes.log; }
+      echo "tuning $NAME for this processor" > ~/.cache/corsia/progress
+      note "Tuning $NAME to this processor in the background (each format timed at its own shape)."
+      if "$TUNER" "$BASE" > "$LOG" 2>&1; then
+        if [ -f "${BASE%.gguf}-cpu.gguf" ]; then
+          note "Tuned copy of $NAME written: $(grep -E "^  [a-z_]+: [0-9]+ tensors" "$LOG" | head -3 | tr -s " " | tr "\n" ";" | cut -c1-220) It is used from the next start."
+        else
+          note "$NAME is already in the fastest formats for this processor: $(grep -E "^  [a-z0-9_]+ [0-9]+ us" "$LOG" | head -1 | tr -s " " | cut -c1-160)."
+        fi
+      else
+        note "Tuning $NAME failed: $(tail -1 "$LOG" | cut -c1-160)"
+      fi
+      date +%F > "$MARK"
+      : > ~/.cache/corsia/progress
+    '
+}
+
 # The models in MODELS_DIR, numbered for `use`: one file each (split parts and the -cpu.gguf
 # copies the tuner writes are left out; a tuned copy is used on its own when it is there).
 model_files() {
@@ -228,6 +264,9 @@ case "${1:-status}" in
         echo "Only $(gib MemAvailable) GiB of memory is free: the cap is $CAP GiB and the model needs about $(need_gib) to sit in memory whole."
         echo "The experts that do not fit stream from the drive, which is slower. Closing other programs first helps."
       fi
+    fi
+    if [ "$DRAFTS" = auto ]; then
+      if [ "$CAP" -ge "$(need_gib)" ]; then DRAFTS=0; else DRAFTS=1; fi
     fi
     # the fork's own switches (CORSIA_...), when set by hand for a test, reach llama-server
     EXTRA=(CORSIA_LOCAL=1)
@@ -296,6 +335,7 @@ case "${1:-status}" in
       '
     echo "Starting Corsia for coding assistants (${CAP} GiB cap, logs in $STATE)."
     echo "It is ready when '$0 status' says so: about a minute to load and fill the expert pool."
+    auto_tune
     ;;
   stop)
     systemctl --user stop "$UNIT-guard" 2>/dev/null || true

@@ -83,11 +83,16 @@ rc=0
 python3 -I - "$MODEL" "$TMP/speed.txt" "$TMP/types.txt" "$MIN_GAIN" "$MAX_GROWTH" <<'EOF' || rc=$?
 import re, struct, sys
 model, speed_file, out_file, min_gain, max_growth = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), float(sys.argv[5])
-NAMES = {0:"f32",1:"f16",2:"q4_0",3:"q4_1",6:"q5_0",7:"q5_1",8:"q8_0",10:"q2_K",11:"q3_K",12:"q4_K",13:"q5_K",14:"q6_K",16:"iq2_xxs",17:"iq2_xs",18:"iq3_xxs",19:"iq1_s",20:"iq4_nl",21:"iq3_s",22:"iq2_s",23:"iq4_xs",29:"iq1_m",30:"bf16"}
+NAMES = {0:"f32",1:"f16",2:"q4_0",3:"q4_1",6:"q5_0",7:"q5_1",8:"q8_0",10:"q2_K",11:"q3_K",12:"q4_K",13:"q5_K",14:"q6_K",16:"iq2_xxs",17:"iq2_xs",18:"iq3_xxs",19:"iq1_s",20:"iq4_nl",21:"iq3_s",22:"iq2_s",23:"iq4_xs",29:"iq1_m",30:"bf16",39:"mxfp4"}
 BPW = {"q2_K":2.625,"q3_K":3.4375,"q4_K":4.5,"q5_K":5.5,"q6_K":6.5625,"q8_0":8.5,"q4_0":4.5,"q4_1":5.0,"q5_0":5.5,"q5_1":6.0,
-       "iq4_xs":4.25,"iq4_nl":4.5,"iq2_xs":2.3125,"iq2_xxs":2.0625,"iq2_s":2.5,"iq3_xxs":3.0625,"iq3_s":3.4375,"iq1_s":1.5625,"iq1_m":1.75}
+       "iq4_xs":4.25,"iq4_nl":4.5,"iq2_xs":2.3125,"iq2_xxs":2.0625,"iq2_s":2.5,"iq3_xxs":3.0625,"iq3_s":3.4375,"iq1_s":1.5625,"iq1_m":1.75,"mxfp4":4.25}
 # formats a tuned copy may use: plain block formats that need no importance matrix
-TARGETS = ["q4_K", "q5_K", "q6_K", "q8_0", "q4_0", "q3_K", "q2_K"]
+TARGETS = ["q4_K", "q5_K", "q6_K", "q8_0", "q4_0", "q5_0", "q3_K", "q2_K"]
+# K-quant blocks hold 256 weights a row; the others 32 (gpt-oss rows are 2,880 wide: no K-quants)
+BLOCK = {t: (256 if t.endswith("_K") else 32) for t in TARGETS}
+# MXFP4's 16 levels are uneven (0, 0.5, 1, 1.5, 2, 3, 4, 6 times a power of two): an even
+# 4-bit grid (Q4_0) loses detail at more bits a weight, so from it only 5 or 8 bits are allowed
+NOT_FROM = {"mxfp4": {"q4_0", "q4_K", "q3_K", "q2_K"}}
 us = {}
 for line in open(speed_file):
     t, v = line.split()
@@ -112,9 +117,11 @@ for _ in range(nt):
     if ty in ("f32", "f16", "bf16", "?") or nd < 2:
         continue
     new = ty
-    if ty in us and ty in BPW and dims[0] % 256 == 0:
+    if ty in us and ty in BPW:
         best = None
         for t in TARGETS:
+            if t in NOT_FROM.get(ty, ()) or dims[0] % BLOCK[t]:
+                continue
             if t in us and BPW[t] >= BPW[ty] and BPW[t] <= BPW[ty] * max_growth and us[ty] / us[t] >= min_gain:
                 if best is None or us[t] < us[best]:
                     best = t

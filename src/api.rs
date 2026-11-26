@@ -259,7 +259,8 @@ fn switch_model(name: &str) -> Result<String, String> {
     let unit = format!("corsia-switch-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
     let mut cmd = std::process::Command::new("systemd-run");
     cmd.args(["--user", "--collect", "--quiet", "--unit", &unit]);
-    for v in ["DRAFTS", "THINK", "THREADS", "CTX", "CAP", "PROJECT_DRAFTS", "CORSIA_REPACK"] {
+    // drafts are left out: each model gets its own choice (local-agent.sh DRAFTS=auto)
+    for v in ["THINK", "THREADS", "CTX", "PROJECT_DRAFTS", "CORSIA_REPACK"] {
         if let Ok(val) = std::env::var(v) {
             if !val.is_empty() {
                 cmd.arg(format!("--setenv={v}={val}"));
