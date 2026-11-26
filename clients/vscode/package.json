@@ -1,0 +1,45 @@
+{
+  "name": "corsia",
+  "displayName": "Corsia",
+  "description": "The models Corsia runs on this machine, in VS Code's chat: pick one in the model picker, chat and use agent mode with it.",
+  "version": "0.1.0",
+  "publisher": "vorynza",
+  "license": "MIT OR Apache-2.0",
+  "engines": { "vscode": "^1.104.0" },
+  "categories": ["AI", "Chat"],
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "corsia",
+        "displayName": "Corsia",
+        "managementCommand": "corsia.manage"
+      }
+    ],
+    "commands": [
+      { "command": "corsia.manage", "title": "Corsia: Open the management page" },
+      { "command": "corsia.refresh", "title": "Corsia: Refresh the model list" }
+    ],
+    "configuration": {
+      "title": "Corsia",
+      "properties": {
+        "corsia.endpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:7720/v1",
+          "description": "Corsia's endpoint for coding assistants (OpenAI-style)."
+        },
+        "corsia.daemon": {
+          "type": "string",
+          "default": "http://127.0.0.1:7715",
+          "description": "Corsia's daemon: the management page and the list of models."
+        },
+        "corsia.startIfStopped": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start Corsia (corsia start) when a chat request finds it stopped."
+        }
+      }
+    }
+  }
+}
