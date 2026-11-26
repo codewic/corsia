@@ -47,8 +47,11 @@ if [ -f "$SETTINGS" ]; then
 fi
 CAP="${CAP:-auto}"
 # The models to choose from (`models`, `use`): ~/models, or ~/models/gguf when that is where they are
-MODELS_DIR="${MODELS_DIR:-$HOME/models}"
-[ -d "$MODELS_DIR" ] || MODELS_DIR="$HOME/models/gguf"
+# (~/models when it holds models, else ~/models/gguf)
+if [ -z "${MODELS_DIR:-}" ]; then
+  MODELS_DIR="$HOME/models"
+  if ! compgen -G "$MODELS_DIR/*.gguf" >/dev/null && [ -d "$HOME/models/gguf" ]; then MODELS_DIR="$HOME/models/gguf"; fi
+fi
 CHOSEN="$HOME/.config/corsia/model"
 # the model: MODEL=, else the last one picked with `use`, else the first 30B found
 if [ -z "${MODEL:-}" ] && [ -s "$CHOSEN" ] && [ -f "$(cat "$CHOSEN")" ]; then MODEL="$(cat "$CHOSEN")"; fi
@@ -231,7 +234,7 @@ models() {
   local i=0 f size need fits mark state running="" total
   total="$(gib MemTotal)"
   systemctl --user is-active --quiet "$UNIT" && running="$(cat "$CHOSEN" 2>/dev/null || true)"
-  echo "Models in $MODELS_DIR (switch with: $0 use NUMBER):"
+  echo "Models in $MODELS_DIR (switch with: corsia use NUMBER):"
   while IFS= read -r f; do
     i=$((i + 1))
     size=$(( ($(stat -c %s "$MODELS_DIR/$f") + 1073741823) >> 30 ))

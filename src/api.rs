@@ -185,15 +185,16 @@ fn respond_bytes(stream: &mut TcpStream, kind: &str, body: &[u8]) -> io::Result<
     stream.write_all(body)
 }
 
-/// The folder models are picked from: CORSIA_MODELS_DIR, else ~/models, else ~/models/gguf
-/// (the same choice as local-agent.sh).
+/// The folder models are picked from: CORSIA_MODELS_DIR, else ~/models when it holds models,
+/// else ~/models/gguf (the same choice as local-agent.sh).
 fn models_dir() -> std::path::PathBuf {
     if let Some(d) = std::env::var_os("CORSIA_MODELS_DIR") {
         return d.into();
     }
     let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let d = home.join("models");
-    if d.is_dir() { d } else { home.join("models/gguf") }
+    let has_models = std::fs::read_dir(&d).map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".gguf"))).unwrap_or(false);
+    if has_models || !home.join("models/gguf").is_dir() { d } else { home.join("models/gguf") }
 }
 
 /// One file per model, as `local-agent.sh models` lists them: split parts, tuned -cpu.gguf
