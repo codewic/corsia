@@ -8,6 +8,8 @@
 //!   sets the machine up to say what they are doing; `corsia watch` shows them. The request
 //!   must carry an `X-Corsia` header, which a web page cannot add without asking first, so a
 //!   page open in a browser cannot write notes.
+//! - Every `status` event also carries `progress`: the job running now and how far along it
+//!   is, read from `~/.cache/corsia/progress` (see `progress_json`), or null.
 //!
 //! Listens on 127.0.0.1 only and checks the Host header, so a web page elsewhere cannot
 //! reach it through DNS rebinding.
@@ -20,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use crate::engine::Engine;
 
-const NOTES_SHOWN: usize = 8;
+// as many as a watcher can show when it gives the notes its whole body
+const NOTES_SHOWN: usize = 40;
 
 fn notes_path() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/corsia/notes.log"))
@@ -33,6 +36,33 @@ fn notes_json() -> String {
     let start = lines.len().saturating_sub(NOTES_SHOWN);
     let items: Vec<String> = lines[start..].iter().map(|l| crate::js(l)).collect();
     format!("[{}]", items.join(","))
+}
+
+/// What is running right now, as one line in `~/.cache/corsia/progress`: optionally a
+/// percentage first ("42% merging the model"), then the text. Whoever runs a long job
+/// rewrites it as the job moves and empties it at the end; a line nobody has touched for
+/// 15 minutes is dropped. JSON: {"text":..,"pct":..|null,"age_s":..} or null.
+fn progress_json() -> String {
+    let Some(path) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/corsia/progress")) else {
+        return "null".into();
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return "null".into();
+    };
+    let age = meta.modified().ok().and_then(|m| m.elapsed().ok()).map_or(0, |d| d.as_secs());
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let line: String = text.lines().next().unwrap_or("").trim().chars().filter(|c| !c.is_control()).take(300).collect();
+    if line.is_empty() || age > 15 * 60 {
+        return "null".into();
+    }
+    let (pct, rest) = match line.split_once(' ') {
+        Some((head, rest)) if head.ends_with('%') => match head.trim_end_matches('%').parse::<f64>() {
+            Ok(p) => (format!("{}", p.clamp(0.0, 100.0)), rest.trim()),
+            Err(_) => ("null".into(), line.as_str()),
+        },
+        _ => ("null".into(), line.as_str()),
+    };
+    format!("{{\"text\":{},\"pct\":{pct},\"age_s\":{age}}}", crate::js(rest))
 }
 
 /// Appends a note with the local time in front; keeps the file to its last 200 lines.
@@ -156,7 +186,7 @@ fn events(stream: &mut TcpStream, engine: &Engine) -> io::Result<()> {
             .collect();
         let status = engine.status_json();
         // Splice the live rates into the status object.
-        let body = format!("{},\"rate_mb_s\":{{{}}},\"notes\":{}}}", &status[..status.len() - 1], rates.join(","), notes_json());
+        let body = format!("{},\"rate_mb_s\":{{{}}},\"notes\":{},\"progress\":{}}}", &status[..status.len() - 1], rates.join(","), notes_json(), progress_json());
         write!(stream, "event: status\ndata: {body}\n\n")?;
         stream.flush()?;
     }

@@ -282,8 +282,11 @@ pub fn draw(f: &mut Frame, store: &Store, daemon: &Daemon, model: Option<&Model>
         Some(_) => 2,
         None => 0,
     };
-    let note_rows = note_lines(&daemon.notes, area.width as usize, th).len() as u16;
-    let notes_h = if daemon.notes.is_empty() { 0 } else { (note_rows + 1).min(14).min(area.height.saturating_sub(panel_h + model_h + 10)) };
+    let note_rows = note_lines(&daemon.notes, area.width as usize, th).len() as u16 + daemon.progress.is_some() as u16;
+    // with no test runs to list, the notes take the room the empty list would have had
+    let no_runs = store.ordered(view.finished).is_empty();
+    let notes_cap = if no_runs { area.height.saturating_sub(panel_h + model_h + 8) } else { 15 };
+    let notes_h = if note_rows == 0 { 0 } else { (note_rows + 1).min(notes_cap).min(area.height.saturating_sub(panel_h + model_h + 6)) };
     let [header, _, body, _, mpanel, _, npanel, _, panel, _, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -331,10 +334,39 @@ fn draw_notes(f: &mut Frame, area: Rect, d: &Daemon, th: &Theme) {
         return;
     }
     let mut out = vec![Line::from(vec![Span::styled("Notes", bold(th.text)), Span::styled("  what is being done on this machine", s(th.muted))])];
+    if let Some(p) = &d.progress {
+        out.push(progress_line(p, area.width as usize, th));
+    }
     let lines = note_lines(&d.notes, area.width as usize, th);
-    let room = area.height.saturating_sub(1) as usize;
+    let room = area.height.saturating_sub(out.len() as u16) as usize;
     out.extend(lines.into_iter().rev().take(room).collect::<Vec<_>>().into_iter().rev());
     f.render_widget(Paragraph::new(out), area);
+}
+
+/// The job running now: "Now", its text, a bar and the percentage when it gives one, and a
+/// warning when it has not moved for two minutes (so a stalled job shows as stalled).
+fn progress_line(p: &crate::daemon::Progress, width: usize, th: &Theme) -> Line<'static> {
+    let quiet = if p.age_s >= 120 { format!("  quiet for {} min", p.age_s / 60) } else { String::new() };
+    let tail = match p.pct {
+        Some(pct) => format!(" {:>3.0}%", pct),
+        None => String::new(),
+    };
+    let bar_w = if p.pct.is_some() { (width / 5).clamp(10, 24) } else { 0 };
+    let room = width.saturating_sub(5 + 2 + bar_w + tail.chars().count() + quiet.chars().count());
+    let mut text: String = p.text.chars().take(room).collect();
+    if p.text.chars().count() > room && room > 1 {
+        text = p.text.chars().take(room - 1).collect::<String>() + "…";
+    }
+    let pad = room.saturating_sub(text.chars().count());
+    let mut spans = vec![Span::styled("Now  ", bold(th.accent)), Span::styled(text, s(th.text)), Span::raw(" ".repeat(pad + 2))];
+    if let Some(pct) = p.pct {
+        spans.extend(bar(Some(pct / 100.0), bar_w, th, p.age_s < 120));
+        spans.push(Span::styled(tail, s(th.text)));
+    }
+    if !quiet.is_empty() {
+        spans.push(Span::styled(quiet, s(th.warn)));
+    }
+    Line::from(spans)
 }
 
 /// The notes as screen lines: each wrapped at word boundaries to the width, the time on its

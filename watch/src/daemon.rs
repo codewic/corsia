@@ -143,11 +143,21 @@ pub struct Daemon {
     pub peak: f64,
     /// What whoever is setting the machine up says they are doing (POST /api/notes).
     pub notes: Vec<String>,
+    /// The job running now (`~/.cache/corsia/progress` on the machine): its text, how far
+    /// along it is when it says, and seconds since it last moved.
+    pub progress: Option<Progress>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Progress {
+    pub text: String,
+    pub pct: Option<f64>,
+    pub age_s: u64,
 }
 
 impl Daemon {
     pub fn new(target: Target) -> Daemon {
-        Daemon { target, link: Link::Connecting, last: None, last_at: None, drives: Vec::new(), total: VecDeque::new(), peak: 0.0, notes: Vec::new() }
+        Daemon { target, link: Link::Connecting, last: None, last_at: None, drives: Vec::new(), total: VecDeque::new(), peak: 0.0, notes: Vec::new(), progress: None }
     }
 
     pub fn apply(&mut self, msg: Msg) {
@@ -194,6 +204,11 @@ impl Daemon {
         if let Some(n) = v["notes"].as_array() {
             self.notes = n.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
         }
+        self.progress = v["progress"]["text"].as_str().map(|t| Progress {
+            text: t.to_string(),
+            pct: v["progress"]["pct"].as_f64(),
+            age_s: v["progress"]["age_s"].as_u64().unwrap_or(0),
+        });
         self.total.push_back(sum);
         if self.total.len() > HISTORY {
             self.total.pop_front();
