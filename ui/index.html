@@ -34,6 +34,13 @@
 
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
+/* Thin, quiet scrollbars in the page's own colours (the Linux defaults are wide, with arrows) */
+* { scrollbar-width: thin; scrollbar-color: var(--fill-strong) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--fill-strong); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--faint); background-clip: padding-box; }
+::-webkit-scrollbar-button { display: none; }
 body {
   background: var(--bg); color: var(--text);
   font: 14px/1.5 "Geist", ui-sans-serif, system-ui, sans-serif;
