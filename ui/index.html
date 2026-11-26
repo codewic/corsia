@@ -172,6 +172,27 @@ main { max-width: 1240px; margin: 0 auto; padding: 16px 16px 48px; }
 @media (prefers-reduced-motion: no-preference) { .art .drift { animation: drift 4s ease-in-out infinite alternate; } }
 @keyframes drift { from { transform: translateX(-6px); } to { transform: translateX(6px); } }
 
+/* Settings */
+.settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 22px 32px; }
+.setting .k { font-weight: 600; }
+.setting .help { color: var(--muted); font-size: 12.5px; margin: 2px 0 10px; }
+.setting .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.seg { display: inline-flex; padding: 3px; gap: 2px; border-radius: 999px; background: var(--fill-strong); }
+.seg button { border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 13px; padding: 4px 12px; border-radius: 999px; cursor: pointer; transition: background-color 160ms var(--ease), color 160ms var(--ease); }
+.seg button:hover { color: var(--text); }
+.seg button[aria-checked="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+@media (prefers-color-scheme: dark) { .seg button[aria-checked="true"] { background: var(--line); } }
+.switch { position: relative; width: 38px; height: 22px; border: 0; border-radius: 999px; background: var(--fill-strong); cursor: pointer; flex: none; transition: background-color 200ms var(--ease); }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: transform 200ms var(--ease); }
+.switch[aria-checked="true"] { background: var(--accent); }
+.switch[aria-checked="true"]::after { transform: translateX(16px); }
+.switch-row { display: flex; align-items: center; gap: 12px; }
+.num-input { width: 70px; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--text); font: inherit; padding: 4px 2px; text-align: right; font-variant-numeric: tabular-nums; }
+.num-input:focus { outline: none; border-bottom-color: var(--accent); }
+.settings-foot { display: flex; align-items: center; gap: 12px; margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.settings-foot .msg { color: var(--muted); font-size: 13px; flex: 1; min-width: 200px; }
+.settings-foot .msg.bad { color: var(--bad); }
+.span12 { grid-column: span 12; }
 .skeleton { display: inline-block; background: var(--fill-strong); border-radius: 6px; color: transparent !important; }
 
 /* Dialog and palette */
@@ -285,6 +306,10 @@ main { max-width: 1240px; margin: 0 auto; padding: 16px 16px 48px; }
       <div class="panel-head"><h2 id="h-drives">Drives</h2><span class="sub">reads for experts not in memory</span></div>
       <div id="drives"></div>
     </section>
+    <section class="panel span12" id="settings-panel" aria-labelledby="h-settings">
+      <div class="panel-head"><h2 id="h-settings">Settings</h2><span class="sub">used by every start: the page, <span class="mono">corsia start</span> and start at login</span></div>
+      <div id="settings"><span class="skeleton" style="width:50%">loading settings</span></div>
+    </section>
   </div>
 </main>
 
@@ -338,7 +363,7 @@ function renderNotice() {
   const n = $("notice");
   if (S.switching) {
     const secs = Math.round((Date.now() - S.switchStart) / 1000);
-    n.innerHTML = `<div class="notice warn">${ICON.warn}<div><b>Switching to ${esc(short(S.switching))}</b><br>The previous model has stopped and this one is loading: about a minute, longer for a model that streams from the drive. This page reconnects on its own. <span class="num">${secs} s</span></div></div>`;
+    n.innerHTML = S.restarting ? `<div class="notice warn">${ICON.warn}<div><b>Restarting Corsia</b><br>${esc(short(S.switching))} is starting again with the saved settings (about a minute). This page reconnects on its own. <span class="num">${secs} s</span></div></div>` : `<div class="notice warn">${ICON.warn}<div><b>Switching to ${esc(short(S.switching))}</b><br>The previous model has stopped and this one is loading: about a minute, longer for a model that streams from the drive. This page reconnects on its own. <span class="num">${secs} s</span></div></div>`;
   } else if (S.switchError) {
     n.innerHTML = `<div class="notice bad">${ICON.bad}<div><b>The switch did not happen</b><br>${esc(S.switchError)}</div><button class="btn act" type="button" id="dismiss">Dismiss</button></div>`;
     $("dismiss").onclick = () => { S.switchError = null; renderNotice(); };
@@ -454,6 +479,91 @@ function renderDrives() {
   el.querySelectorAll("svg[data-drive]").forEach((svg) => { const h = S.drives[svg.dataset.drive] || []; spark(svg, h.slice(-60), Math.max(50, ...h)); });
 }
 
+// Settings: the saved file, edits held until Save, start at login applied at once
+const SET = {
+  CAP: { label: "Memory cap", help: "How much memory the model may use. Automatic gives it what it needs, or what is free less a reserve for your other programs." },
+  CTX: { label: "Context length", help: "How much text the model can keep in view. Coding assistants send long prompts; more context takes more memory." },
+  DRAFTS: { label: "Drafts", help: "Guesses the next words from what is already written. Automatic: off when the model fits in memory (the processor is the limit), on when it streams from the drive." },
+  THINK: { label: "Thinking", help: "Lets the model reason before it answers. Off answers far sooner; on can help with hard problems." },
+  THREADS: { label: "Threads", help: "Processor threads for the model. Automatic uses one per physical core, the fastest on every machine measured." },
+  TUNE: { label: "Tune new models", help: "On a model's first start, times each weight format on this processor and writes a faster copy when there is one." },
+};
+function loadSettings() {
+  return fetch("/api/settings", { cache: "no-store" }).then((r) => r.ok ? r.json() : null).then((j) => {
+    if (!j) return;
+    S.settings = j;
+    if (!S.draft) S.draft = { ...j.saved };
+    renderSettings();
+  }).catch(() => {});
+}
+function seg(key, opts) {
+  const v = S.draft[key];
+  return `<div class="seg" role="radiogroup" aria-label="${esc(SET[key].label)}">${opts.map(([val, label]) => `<button type="button" role="radio" aria-checked="${v === val || (val === "fixed" && v !== "auto")}" data-key="${key}" data-val="${val}">${esc(label)}</button>`).join("")}</div>`;
+}
+function sw(key, on, label) { return `<button type="button" class="switch" role="switch" aria-checked="${on}" aria-label="${esc(label)}" data-switch="${key}"></button>`; }
+function renderSettings() {
+  const el = $("settings"), st = S.settings;
+  if (!st) return;
+  const d = S.draft, run = st.running || {};
+  const changed = Object.keys(st.saved).filter((k) => d[k] !== st.saved[k]);
+  const stale = Object.keys(run).filter((k) => st.saved[k] !== undefined && run[k] !== st.saved[k] && !(k === "DRAFTS" && st.saved[k] === "auto"));
+  const field = (key, control) => `<div class="setting"><div class="k" id="k-${key}">${esc(SET[key].label)}</div><div class="help">${esc(SET[key].help)}</div><div class="row">${control}</div></div>`;
+  el.innerHTML = `<div class="settings">
+    <div class="setting"><div class="k">Start at login</div><div class="help">Starts Corsia with the chosen model when you log in, so VS Code and the chat work right after a restart. Applies at once.</div><div class="switch-row">${sw("AUTOSTART", st.autostart, "Start at login")}<span>${st.autostart ? "On" : "Off"}</span></div></div>
+    ${field("CAP", seg("CAP", [["auto", "Automatic"], ["fixed", "Fixed"]]) + (d.CAP !== "auto" ? `<input class="num-input" type="number" inputmode="numeric" min="4" max="${st.mem_total_gib}" value="${esc(d.CAP)}" data-num="CAP" aria-labelledby="k-CAP"> <span class="meta">GiB of ${st.mem_total_gib}</span>` : ""))}
+    ${field("CTX", seg("CTX", [["8192", "8K"], ["16384", "16K"], ["32768", "32K"], ["65536", "64K"], ["131072", "128K"]]))}
+    ${field("DRAFTS", seg("DRAFTS", [["auto", "Automatic"], ["1", "On"], ["0", "Off"]]))}
+    ${field("THINK", `<div class="switch-row">${sw("THINK", d.THINK === "1", "Thinking")}<span>${d.THINK === "1" ? "On" : "Off"}</span></div>`)}
+    ${field("THREADS", seg("THREADS", [["auto", "Automatic"], ["fixed", "Fixed"]]) + (d.THREADS !== "auto" ? `<input class="num-input" type="number" inputmode="numeric" min="1" max="${st.cpus}" value="${esc(d.THREADS)}" data-num="THREADS" aria-labelledby="k-THREADS"> <span class="meta">of ${st.cpus}</span>` : ""))}
+    ${field("TUNE", `<div class="switch-row">${sw("TUNE", d.TUNE === "1", "Tune new models")}<span>${d.TUNE === "1" ? "On" : "Off"}</span></div>`)}
+  </div>
+  <div class="settings-foot">
+    <span class="msg ${S.settingsError ? "bad" : ""}" id="set-msg" role="status">${esc(S.settingsError || (changed.length ? `${changed.length} unsaved change${changed.length === 1 ? "" : "s"}` : stale.length ? "Saved. The running model was started with different settings: restart to use them." : "Saved settings are in use."))}</span>
+    ${stale.length && !changed.length ? `<button class="btn" type="button" id="set-restart">Restart Corsia</button>` : ""}
+    <button class="btn primary" type="button" id="set-save" ${changed.length ? "" : "disabled"}>Save settings</button>
+  </div>`;
+  el.querySelectorAll("[data-key]").forEach((b) => (b.onclick = () => {
+    const k = b.dataset.key, v = b.dataset.val;
+    d[k] = v === "fixed" ? (k === "CAP" ? String(Math.max(4, Math.floor(st.mem_total_gib * 0.8))) : String(Math.max(1, Math.floor(st.cpus / 2)))) : v;
+    S.settingsError = null; renderSettings();
+  }));
+  el.querySelectorAll("[data-num]").forEach((i) => (i.onchange = () => { d[i.dataset.num] = String(Math.round(+i.value || 0)); S.settingsError = null; renderSettings(); }));
+  el.querySelectorAll("[data-switch]").forEach((b) => (b.onclick = () => {
+    const k = b.dataset.switch;
+    if (k === "AUTOSTART") { saveSettings({ AUTOSTART: st.autostart ? "off" : "on" }); return; }
+    d[k] = d[k] === "1" ? "0" : "1"; S.settingsError = null; renderSettings();
+  }));
+  $("set-save").onclick = () => { const out = {}; changed.forEach((k) => (out[k] = d[k])); saveSettings(out); };
+  if ($("set-restart")) $("set-restart").onclick = confirmRestart;
+}
+async function saveSettings(values) {
+  try {
+    const r = await fetch("/api/settings", { method: "POST", headers: { "X-Corsia": "1", "Content-Type": "text/plain" }, body: Object.entries(values).map(([k, v]) => `${k}=${v}`).join("\n") });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { S.settingsError = j.error || `Corsia answered ${r.status}.`; renderSettings(); return; }
+    S.settings = j; S.draft = { ...j.saved }; S.settingsError = null;
+    toast(values.AUTOSTART ? (values.AUTOSTART === "on" ? "Corsia starts at login" : "Start at login is off") : "Settings saved");
+    renderSettings();
+  } catch { S.settingsError = "The settings did not reach Corsia. Check that it is running, then try again."; renderSettings(); }
+}
+function confirmRestart() {
+  const prev = document.activeElement;
+  $("layer").innerHTML = `<div class="backdrop" id="bd"></div><div class="modal dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-h" aria-describedby="dlg-p"><h3 id="dlg-h">Restart Corsia?</h3><p id="dlg-p">The model stops and starts again with the saved settings, so VS Code and the chat are without it for about a minute.</p><div class="actions"><button class="btn" type="button" id="dlg-no">Cancel</button><button class="btn primary" type="button" id="dlg-yes">Restart Corsia</button></div></div>`;
+  const close = () => { $("layer").innerHTML = ""; $("layer").onkeydown = null; prev && prev.focus && prev.focus(); };
+  $("bd").onclick = close; $("dlg-no").onclick = close;
+  $("dlg-yes").onclick = async () => {
+    close();
+    try {
+      const r = await fetch("/api/restart", { method: "POST", headers: { "X-Corsia": "1" }, body: "" });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); S.switchError = j.error || `Corsia answered ${r.status}.`; render(); return; }
+      S.switching = S.status ? S.status.model.name.replace("-cpu.gguf", ".gguf") : "the model"; S.switchStart = Date.now(); S.restarting = true; S.settings = null; S.draft = null;
+      render();
+    } catch { S.switchError = "The restart request did not reach Corsia."; render(); }
+  };
+  $("layer").onkeydown = (e) => { if (e.key === "Escape") close(); };
+  $("dlg-yes").focus();
+}
+
 function render() { renderHeader(); renderNotice(); renderNow(); renderSpeed(); renderLive(); renderActivity(); renderModels(); renderDrives(); }
 
 // Live data: the daemon's status every second, the endpoint's finished requests and live text
@@ -464,8 +574,11 @@ function connect() {
     const changed = !S.status || S.status.model.name !== st.model.name || !S.connected;
     S.status = st; S.progress = st.progress; S.connected = true;
     for (const [d, r] of Object.entries(st.rate_mb_s || {})) { (S.drives[d] ||= []).push(r); if (S.drives[d].length > 120) S.drives[d].shift(); }
-    if (S.switching && st.model.name.replace("-cpu.gguf", ".gguf") === S.switching) { toast(`${short(S.switching)} is running`); S.switching = null; }
-    if (changed) loadModels();
+    if (S.switching && st.model.name.replace("-cpu.gguf", ".gguf") === S.switching && (!S.restarting || st.uptime_s * 1000 < Date.now() - S.switchStart)) {
+      toast(S.restarting ? "Corsia restarted with the saved settings" : `${short(S.switching)} is running`);
+      S.switching = null; S.restarting = false; loadSettings();
+    }
+    if (changed) { loadModels(); if (!S.settings) loadSettings(); }
     render();
   });
   es.onerror = () => { if (S.connected) { S.connected = false; render(); } };
@@ -544,6 +657,8 @@ function actions() {
   const out = [], m = S.models;
   if (m && m.chat_port && S.connected && !S.switching) out.push({ label: "Open chat", meta: "new tab", run: () => window.open($("chat").href, "_blank", "noopener") });
   if (m && m.agent_port) out.push({ label: "Copy the VS Code endpoint", meta: `${location.hostname}:${m.agent_port}/v1`, run: () => navigator.clipboard && navigator.clipboard.writeText(`http://${location.hostname}:${m.agent_port}/v1`).then(() => toast("Endpoint copied")) });
+  out.push({ label: "Open settings", meta: "", run: () => { $("settings-panel").scrollIntoView({ behavior: "smooth", block: "start" }); setTimeout(() => { const f = $("settings").querySelector("button"); f && f.focus(); }, 300); } });
+  if (S.connected && !S.switching) out.push({ label: "Restart Corsia", meta: "saved settings", run: confirmRestart });
   (m ? m.models : []).forEach((x) => { if (x.name !== m.serving && !S.switching) out.push({ label: "Run " + short(x.name), meta: gib(x.bytes), run: () => confirmSwitch(x.name) }); });
   return out;
 }
@@ -581,6 +696,7 @@ render();
 connect();
 connectAgent();
 loadModels();
+loadSettings();
 </script>
 </body>
 </html>

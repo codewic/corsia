@@ -131,7 +131,7 @@ fn handle(mut stream: TcpStream, engine: &Engine, port: u16) -> io::Result<()> {
     if !host_ok {
         return respond(&mut stream, 403, "text/plain", "Corsia only answers requests addressed to 127.0.0.1 or localhost.\n");
     }
-    if method == "POST" && (path == "/api/notes" || path == "/api/models/use") {
+    if method == "POST" && matches!(path, "/api/notes" | "/api/models/use" | "/api/settings" | "/api/restart") {
         if !marked {
             return respond(&mut stream, 403, "text/plain", "This needs an X-Corsia header.\n");
         }
@@ -142,19 +142,32 @@ fn handle(mut stream: TcpStream, engine: &Engine, port: u16) -> io::Result<()> {
             add_note(&body)?;
             return respond(&mut stream, 200, "application/json", &notes_json());
         }
+        if path == "/api/settings" {
+            return match save_settings(&body) {
+                Ok(()) => respond(&mut stream, 200, "application/json", &settings_json()),
+                Err(why) => respond(&mut stream, 400, "application/json", &format!("{{\"error\":{}}}", crate::js(&why))),
+            };
+        }
+        if path == "/api/restart" {
+            return match run_detached("restart", &["restart"]) {
+                Ok(()) => respond(&mut stream, 202, "application/json", "{\"restarting\":true}"),
+                Err(why) => respond(&mut stream, 400, "application/json", &format!("{{\"error\":{}}}", crate::js(&why))),
+            };
+        }
         return match switch_model(body.trim()) {
             Ok(name) => respond(&mut stream, 202, "application/json", &format!("{{\"switching\":{}}}", crate::js(&name))),
             Err(why) => respond(&mut stream, 400, "application/json", &format!("{{\"error\":{}}}", crate::js(&why))),
         };
     }
     if method != "GET" {
-        return respond(&mut stream, 405, "text/plain", "Only GET is supported (and POST to /api/notes and /api/models/use).\n");
+        return respond(&mut stream, 405, "text/plain", "Only GET is supported (and POST to /api/notes, /api/models/use, /api/settings and /api/restart).\n");
     }
     match path.split('?').next().unwrap_or("") {
         "/api/status" => respond(&mut stream, 200, "application/json", &engine.status_json()),
         "/api/notes" => respond(&mut stream, 200, "application/json", &notes_json()),
         "/api/events" => events(&mut stream, engine),
         "/api/models" => respond(&mut stream, 200, "application/json", &models_json(engine)),
+        "/api/settings" => respond(&mut stream, 200, "application/json", &settings_json()),
         "/api/agent/events" | "/api/agent/live" | "/api/agent" => agent_proxy(&mut stream, path),
         "/" | "/index.html" => respond(&mut stream, 200, "text/html", UI_PAGE),
         "/ui/geist.woff2" => respond_bytes(&mut stream, "font/woff2", UI_FONT),
@@ -248,28 +261,115 @@ fn switch_model(name: &str) -> Result<String, String> {
     if !model_files().iter().any(|(n, _)| n == name) {
         return Err(format!("There is no model called {name} in {}.", models_dir().display()));
     }
-    let script = std::env::var_os("CORSIA_LOCAL_AGENT").map(std::path::PathBuf::from).or_else(|| {
-        // target/release/corsia -> integrations/llama.cpp/local-agent.sh
-        let exe = std::env::current_exe().ok()?;
-        Some(exe.parent()?.parent()?.parent()?.join("integrations/llama.cpp/local-agent.sh"))
-    });
-    let Some(script) = script.filter(|p| p.is_file()) else {
+    let Some(script) = crate::local_agent_script() else {
         return Err("Corsia cannot find local-agent.sh to switch models with (set CORSIA_LOCAL_AGENT).".into());
     };
     let unit = format!("corsia-switch-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+    // nothing of this service's own settings is passed on: the next model reads the saved
+    // settings (~/.config/corsia/settings.env), and drafts are chosen per model
     let mut cmd = std::process::Command::new("systemd-run");
     cmd.args(["--user", "--collect", "--quiet", "--unit", &unit]);
-    // drafts are left out: each model gets its own choice (local-agent.sh DRAFTS=auto)
-    for v in ["THINK", "THREADS", "CTX", "PROJECT_DRAFTS", "CORSIA_REPACK"] {
-        if let Ok(val) = std::env::var(v) {
-            if !val.is_empty() {
-                cmd.arg(format!("--setenv={v}={val}"));
-            }
-        }
-    }
     cmd.arg(&script).args(["use", name]);
     match cmd.status() {
         Ok(s) if s.success() => Ok(name.to_string()),
+        Ok(s) => Err(format!("systemd-run failed ({s}).")),
+        Err(e) => Err(format!("systemd-run could not start: {e}.")),
+    }
+}
+
+// Settings: one file, ~/.config/corsia/settings.env, read by local-agent.sh at every start
+// (and so by `corsia start`, start at login and model switches); the environment wins over it.
+const SETTINGS: [(&str, &str); 6] = [("CAP", "auto"), ("CTX", "32768"), ("DRAFTS", "auto"), ("THINK", "0"), ("THREADS", "auto"), ("TUNE", "1")];
+const CONTEXTS: [&str; 6] = ["4096", "8192", "16384", "32768", "65536", "131072"];
+
+fn settings_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config/corsia/settings.env")
+}
+
+fn saved_settings() -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(settings_path()).unwrap_or_default();
+    SETTINGS
+        .iter()
+        .map(|(k, def)| {
+            let v = text.lines().find_map(|l| l.strip_prefix(&format!("{k}=")).map(str::trim).filter(|v| !v.is_empty())).unwrap_or(def);
+            (k.to_string(), v.to_string())
+        })
+        .collect()
+}
+
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+/// {"saved":{...},"defaults":{...},"running":{...},"autostart":bool,"mem_total_gib":n,"cpus":n}
+/// "running" is what the model now serving was started with (the service passes it on).
+fn settings_json() -> String {
+    let obj = |pairs: &[(String, String)]| format!("{{{}}}", pairs.iter().map(|(k, v)| format!("{}:{}", crate::js(k), crate::js(v))).collect::<Vec<_>>().join(","));
+    let defaults: Vec<(String, String)> = SETTINGS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let running: Vec<(String, String)> = ["CTX", "DRAFTS", "THINK", "THREADS"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), if v.is_empty() { "auto".into() } else { v })))
+        .collect();
+    let autostart = std::process::Command::new("systemctl").args(["--user", "is-enabled", "--quiet", "corsia.service"]).status().is_ok_and(|s| s.success());
+    format!(
+        "{{\"saved\":{},\"defaults\":{},\"running\":{},\"autostart\":{autostart},\"mem_total_gib\":{},\"cpus\":{}}}",
+        obj(&saved_settings()),
+        obj(&defaults),
+        obj(&running),
+        meminfo_mib("MemTotal:") / 1024,
+        cores()
+    )
+}
+
+/// Saves KEY=VALUE lines (only the known keys, each checked); AUTOSTART=on|off turns start at
+/// login on or off right away.
+fn save_settings(body: &str) -> Result<(), String> {
+    let mut values = saved_settings();
+    let mem = meminfo_mib("MemTotal:") / 1024;
+    for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Some((k, v)) = line.split_once('=') else { return Err(format!("\"{line}\" is not KEY=VALUE.")) };
+        let (k, v) = (k.trim(), v.trim());
+        let num = v.parse::<u64>().ok();
+        let ok = match k {
+            "CAP" => v == "auto" || num.is_some_and(|n| (4..=mem.max(4)).contains(&n)),
+            "CTX" => CONTEXTS.contains(&v),
+            "DRAFTS" => matches!(v, "auto" | "0" | "1"),
+            "THINK" | "TUNE" => matches!(v, "0" | "1"),
+            "THREADS" => v == "auto" || num.is_some_and(|n| (1..=cores() as u64).contains(&n)),
+            "AUTOSTART" => matches!(v, "on" | "off"),
+            _ => return Err(format!("{k} is not a Corsia setting.")),
+        };
+        if !ok {
+            return Err(format!("{v} is not a valid value for {k}."));
+        }
+        if k == "AUTOSTART" {
+            let script = crate::local_agent_script().ok_or("Corsia cannot find local-agent.sh (set CORSIA_LOCAL_AGENT).")?;
+            let st = std::process::Command::new(script).args(["autostart", v]).output().map_err(|e| format!("could not change start at login: {e}"))?;
+            if !st.status.success() {
+                return Err(format!("Start at login could not be changed: {}", String::from_utf8_lossy(&st.stderr).trim()));
+            }
+        } else if let Some(slot) = values.iter_mut().find(|(name, _)| name == k) {
+            slot.1 = v.to_string();
+        }
+    }
+    let path = settings_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut text = String::from("# Corsia settings (the management page writes this file; local-agent.sh reads it at every start)\n");
+    for (k, v) in values {
+        text.push_str(&format!("{k}={v}\n"));
+    }
+    std::fs::write(&path, text).map_err(|e| format!("could not save the settings: {e}"))
+}
+
+/// Runs local-agent.sh with these arguments as its own short-lived unit (it stops the
+/// service this daemon runs in, so it cannot be a child).
+fn run_detached(what: &str, args: &[&str]) -> Result<(), String> {
+    let script = crate::local_agent_script().ok_or("Corsia cannot find local-agent.sh (set CORSIA_LOCAL_AGENT).")?;
+    let unit = format!("corsia-{what}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+    match std::process::Command::new("systemd-run").args(["--user", "--collect", "--quiet", "--unit", &unit]).arg(&script).args(args).status() {
+        Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(format!("systemd-run failed ({s}).")),
         Err(e) => Err(format!("systemd-run could not start: {e}.")),
     }

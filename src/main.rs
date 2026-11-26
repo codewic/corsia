@@ -51,6 +51,7 @@ fn main() -> ExitCode {
         },
         Some("watch") => watch_cmd(&args[1..]),
         Some("agent") => agent::run(&args[1..]),
+        Some("start" | "stop" | "restart" | "status" | "models" | "use" | "autostart" | "setup" | "install" | "logs") => local_agent_cmd(&args),
         Some("--version" | "-V") => {
             println!("{BIN} {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -67,6 +68,9 @@ fn help() -> String {
     format!(
         "{NAME} {ver}: stream model weights from every drive you have, at their combined speed.
 Usage:
+  {BIN} start | stop | restart | status    the local model for coding assistants (chosen model, saved settings)
+  {BIN} models | use N|NAME                list the models in ~/models, switch to one
+  {BIN} autostart on|off                   start it at login
   {BIN} agent [--upstream HOST:PORT] [--port N] [--slots N] [--snapshots DIR]
                [--min-snapshot-tokens N] [--volatile LABEL]... [--log FILE] [--plain]
                [--corpus FILE|off] [--think on|off]
@@ -174,6 +178,29 @@ fn watch_cmd(args: &[String]) -> ExitCode {
             "{name} is not built yet. Build it with: cargo build --release --manifest-path watch/Cargo.toml"
         )),
         Err(e) => fail(&format!("could not start {name}: {e}")),
+    }
+}
+
+/// The script that runs Corsia for coding assistants on this machine (local-agent.sh):
+/// CORSIA_LOCAL_AGENT, else beside the source tree this binary was built in
+/// (target/release/corsia -> integrations/llama.cpp/local-agent.sh).
+pub(crate) fn local_agent_script() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("CORSIA_LOCAL_AGENT") {
+        return Some(PathBuf::from(p)).filter(|p| p.is_file());
+    }
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.parent()?.parent()?.join("integrations/llama.cpp/local-agent.sh")).filter(|p| p.is_file())
+}
+
+/// `corsia start | stop | restart | status | models | use N | autostart on|off | setup |
+/// install | logs`: the everyday commands, handed to local-agent.sh.
+fn local_agent_cmd(args: &[String]) -> ExitCode {
+    let Some(script) = local_agent_script() else {
+        return fail("cannot find local-agent.sh beside this build (set CORSIA_LOCAL_AGENT to its path)");
+    };
+    match std::process::Command::new(&script).args(args).status() {
+        Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(0, 255) as u8),
+        Err(e) => fail(&format!("could not run {}: {e}", script.display())),
     }
 }
 

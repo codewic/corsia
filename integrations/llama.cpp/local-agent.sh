@@ -5,7 +5,11 @@
 # reusable (stable prefix, slots, KV snapshots on disk). All three run as one systemd user
 # service under a memory cap, so the rest of the machine keeps its memory.
 #
-# Usage:  integrations/llama.cpp/local-agent.sh setup | models | use N | start | stop | status | logs
+# Usage:  integrations/llama.cpp/local-agent.sh setup | install | models | use N | start | stop | restart | status | autostart on|off | logs
+#   install           puts `corsia` on the PATH and turns on start at login
+#   autostart on|off  start Corsia at login with the chosen model and saved settings
+#   restart           stop, then start (picks up changed settings)
+# Settings: ~/.config/corsia/settings.env (the management page edits it), the environment wins over it
 #   models            the models in ~/models, numbered, with their size and whether they fit in memory
 #   use N|NAME        switch to one of them (stops the one running); start uses it from then on
 #   setup             run once per machine and model: checks the processor, memory and drive,
@@ -31,6 +35,16 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CORSIA="$(cd "$HERE/../.." && pwd)"
+# Settings saved by the management page (or by hand), one KEY=VALUE a line: CAP, CTX, DRAFTS,
+# THINK, THREADS, TUNE. A value given in the environment wins over the file.
+SETTINGS="$HOME/.config/corsia/settings.env"
+if [ -f "$SETTINGS" ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in
+      CAP|CTX|DRAFTS|THINK|THREADS|TUNE) if [ -z "${!k:-}" ] && [ -n "$v" ]; then printf -v "$k" '%s' "$v"; fi ;;
+    esac
+  done < <(grep -E '^[A-Z]+=[A-Za-z0-9]+$' "$SETTINGS")
+fi
 CAP="${CAP:-auto}"
 # The models to choose from (`models`, `use`): ~/models, or ~/models/gguf when that is where they are
 MODELS_DIR="${MODELS_DIR:-$HOME/models}"
@@ -60,6 +74,8 @@ DRAFTS="${DRAFTS:-auto}"
 PROJECT_DRAFTS="${PROJECT_DRAFTS:-0}"
 THINK="${THINK:-0}"
 THREADS="${THREADS:-}"
+[ "$THREADS" != auto ] || THREADS=""
+AUTOSTART_UNIT="$HOME/.config/systemd/user/corsia.service"
 CORPUS="$HOME/.cache/corsia/corpus/current.tok"
 
 die() { echo "local-agent: $*" >&2; exit 1; }
@@ -247,8 +263,53 @@ use_model() {
   MODEL="$MODELS_DIR/$f" exec "$0" start
 }
 
+# Start at login: a user unit that runs `start` when the desktop session begins (and `stop`
+# when it ends), with the chosen model and the saved settings. `autostart on|off|status`.
+autostart() {
+  case "${1:-status}" in
+    on)
+      mkdir -p "$(dirname "$AUTOSTART_UNIT")"
+      cat > "$AUTOSTART_UNIT" <<UNITEOF
+[Unit]
+Description=Corsia: the local model for coding assistants (chosen model, saved settings)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$HERE/local-agent.sh start
+ExecStop=$HERE/local-agent.sh stop
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target
+UNITEOF
+      systemctl --user daemon-reload
+      systemctl --user enable --quiet corsia.service
+      echo "Corsia starts at login with the chosen model."
+      ;;
+    off)
+      systemctl --user disable --quiet corsia.service 2>/dev/null || true
+      echo "Corsia no longer starts at login (start it with: corsia start)."
+      ;;
+    status)
+      if systemctl --user is-enabled --quiet corsia.service 2>/dev/null; then echo "on"; else echo "off"; fi
+      ;;
+    *) die "autostart on | off | status" ;;
+  esac
+}
+
+# `corsia` on the PATH (~/.local/bin, which Ubuntu adds at login once it exists)
+install_command() {
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$CORSIA_BIN" "$HOME/.local/bin/corsia"
+  echo "The corsia command is in ~/.local/bin (a new terminal finds it)."
+}
+
 case "${1:-status}" in
   models) models ;;
+  autostart) autostart "${2:-status}" ;;
+  install) install_command; autostart on ;;
+  restart) "$0" stop >/dev/null; exec "$0" start ;;
   use) use_model "${2:-}" ;;
   start)
     if systemctl --user is-active --quiet "$UNIT"; then status; exit 0; fi
@@ -349,5 +410,5 @@ case "${1:-status}" in
   status) status ;;
   setup) setup ;;
   logs) tail -n 20 "$STATE/serve.log" "$STATE/llama-server.log" "$STATE/agent.log" 2>/dev/null ;;
-  *) die "usage: $0 setup | models | use N | start | stop | status | logs" ;;
+  *) die "usage: $0 setup | install | models | use N | start | stop | restart | status | autostart on|off | logs" ;;
 esac
