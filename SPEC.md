@@ -65,7 +65,7 @@ The daemon owns the work; the UI is a client of it, so the engine stays headless
 4. **Hinted mode:** engines read through a private socket straight into shared memory (protocol v1 in `src/hint.rs`). Daemon side, reference client and bench done 2026-11-22: matches direct reads, 1.6 to 2x blind mode. The llama.cpp patch is next.
 5. **Expert streaming:** llama.cpp memory-maps the model from the mount; its router's choices (`ffn_moe_topk`) trigger one PREFETCH per layer that Corsia stores straight into the page cache. Built 2026-11-22 (protocol, clients, llama.cpp patch 0002, test script); the speed verdict needs the 40 GB machine.
 6. **Progressive weights:** coarse and fine split, measured for size here and for quality on the 40 GB machine.
-7. **Management UI** on the daemon's API.
+7. **Management UI** on the daemon's API. First version 2026-11-26: the daemon serves `ui/index.html` at `/` with the three-zone header (mark and trail, command palette, live status and the Chat button), the running model and machine memory, writing and prompt speed per request, the model's live text, the models in `~/models` with a confirmed switch, drives and cache, and the notes with the Now line. Lanes, placement, plug-in and bench screens are still to come.
 8. **Layout rewrite, parity, LAN tier.**
 
 ## 6. Rules
