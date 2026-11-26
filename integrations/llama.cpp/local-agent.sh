@@ -231,7 +231,7 @@ case "${1:-status}" in
     fi
     # the fork's own switches (CORSIA_...), when set by hand for a test, reach llama-server
     EXTRA=(CORSIA_LOCAL=1)
-    for v in CORSIA_COOL CORSIA_OP_PROFILE CORSIA_FIRST CORSIA_GQA_TILED CORSIA_Q8_SCORES CORSIA_HEAD_PREVIEW CORSIA_KV_FIRST; do
+    for v in CORSIA_COOL CORSIA_OP_PROFILE CORSIA_FIRST CORSIA_GQA_TILED CORSIA_Q8_SCORES CORSIA_HEAD_PREVIEW CORSIA_KV_FIRST CORSIA_REPACK; do
       if [ -n "${!v:-}" ]; then EXTRA+=("$v=${!v}"); fi
     done
     # a mount left behind by a killed run answers "Transport endpoint is not connected":
