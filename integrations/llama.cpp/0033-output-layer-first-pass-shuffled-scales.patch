@@ -1,0 +1,82 @@
+From 4f75264167bdbd9ab826d6cfd26d2b54e024ac2d Mon Sep 17 00:00:00 2001
+From: codewic <codewic@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:22:08 +0000
+Subject: [PATCH] Two-stage output layer: scales from one load and shuffles in
+ the first pass
+
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 56 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index e9f3dc3..2872e9f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1319,8 +1319,64 @@ typedef struct {
+ static corsia_q6k_hi * corsia_head_hi;
+ static const void *    corsia_head_hi_of;
+ 
++#if defined(__AVX2__)
++// The first pass with the scales of a block taken from one 16-byte load by byte shuffles
++// (as ggml's own Q6_K kernel does), instead of 16 single-value broadcasts per block. The
++// same integer sums in the same order, so the same result to the bit; the broadcasts made
++// the pass arithmetic-bound (12 to 13.5 GB/s against 20 to 24 for the other matmuls).
++// CORSIA_HEAD_FAST=0 uses the old loop.
++static inline __m128i corsia_scale_pair(int i) {
++    static const uint8_t k_shuffle[128] = {
++         0, 0, 0, 0, 0, 0, 0, 0,  1, 1, 1, 1, 1, 1, 1, 1,
++         2, 2, 2, 2, 2, 2, 2, 2,  3, 3, 3, 3, 3, 3, 3, 3,
++         4, 4, 4, 4, 4, 4, 4, 4,  5, 5, 5, 5, 5, 5, 5, 5,
++         6, 6, 6, 6, 6, 6, 6, 6,  7, 7, 7, 7, 7, 7, 7, 7,
++         8, 8, 8, 8, 8, 8, 8, 8,  9, 9, 9, 9, 9, 9, 9, 9,
++        10,10,10,10,10,10,10,10, 11,11,11,11,11,11,11,11,
++        12,12,12,12,12,12,12,12, 13,13,13,13,13,13,13,13,
++        14,14,14,14,14,14,14,14, 15,15,15,15,15,15,15,15
++    };
++    return _mm_loadu_si128((const __m128i *) k_shuffle + i);
++}
++
++static float corsia_q6k_high_dot_fast(const corsia_q6k_hi * x, const block_q8_K * y, int nb) {
++    const __m256i m3 = _mm256_set1_epi8(3);
++    __m256 acc = _mm256_setzero_ps();
++    for (int i = 0; i < nb; i++) {
++        const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
++        const __m128i sc8 = _mm_loadu_si128((const __m128i *) x[i].scales);
++        const __m256i sb = _mm256_madd_epi16(_mm256_cvtepi8_epi16(sc8), _mm256_loadu_si256((const __m256i *) y[i].bsums));
++        __m256i sumi = _mm256_setzero_si256();
++        for (int n = 0; n < 2; n++) {
++            const __m256i qh = _mm256_loadu_si256((const __m256i *) (x[i].qh + 32*n));
++            const int8_t * q8 = y[i].qs + 128*n;
++            for (int k = 0; k < 4; k++) {
++                const __m256i h = _mm256_and_si256(_mm256_srli_epi16(qh, 2*k), m3);
++                const __m256i p = _mm256_maddubs_epi16(h, _mm256_loadu_si256((const __m256i *) (q8 + 32*k)));
++                const __m256i s = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(sc8, corsia_scale_pair(4*n + k)));
++                sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(p, s));
++            }
++        }
++        const __m256i v = _mm256_sub_epi32(_mm256_slli_epi32(sumi, 4), _mm256_mullo_epi32(sb, _mm256_set1_epi32(24)));
++        acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(v)));
++    }
++    __m128 r = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
++    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
++    r = _mm_add_ss(r, _mm_movehdup_ps(r));
++    return _mm_cvtss_f32(r);
++}
++#endif
++
+ static float corsia_q6k_high_dot(const corsia_q6k_hi * x, const block_q8_K * y, int nb) {
+ #if defined(__AVX2__)
++    static int fast = -1;
++    if (fast < 0) {
++        const char * e = getenv("CORSIA_HEAD_FAST");
++        fast = !(e && strcmp(e, "0") == 0);
++    }
++    if (fast) {
++        return corsia_q6k_high_dot_fast(x, y, nb);
++    }
+     const __m256i m3 = _mm256_set1_epi8(3);
+     __m256 acc = _mm256_setzero_ps();
+     for (int i = 0; i < nb; i++) {
+-- 
+2.53.0
+
