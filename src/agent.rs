@@ -60,7 +60,7 @@ impl AgentArgs {
             snapshots: None,
             slots: 2,
             rewrite: true,
-            min_snapshot_tokens: 2048,
+            min_snapshot_tokens: 1024,
             log: None,
             volatile: vec![],
             corpus: std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/corsia/corpus/current.tok")),
@@ -642,7 +642,10 @@ fn chat(stream: &mut TcpStream, state: &State, req: &Request) -> io::Result<()> 
         prefix_key(&body)
     };
     rec.key = key;
-    let big = prefix_chars >= 8_000;
+    // A system prompt and tools this long take a CPU a minute or more to read (about 17
+    // tokens/s for a 30B model on a laptop), while restoring a snapshot takes under a second.
+    // Titles and other side requests stay well under it.
+    let big = prefix_chars >= 4_000;
 
     let mut slot = None;
     if state.args.rewrite {
