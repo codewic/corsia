@@ -12,13 +12,15 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { friendlyModelName, friendlyModelNames } = require("./names");
 
 const cfg = () => vscode.workspace.getConfiguration("corsia");
 const endpoint = () => cfg().get("endpoint").replace(/\/+$/, "");
 const daemon = () => cfg().get("daemon").replace(/\/+$/, "");
 const agentStatus = () => endpoint().replace(/\/v1$/, "") + "/api/agent";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const short = (name) => name.replace(/\.gguf$/, "");
+// A model as people read it ("gpt-oss 20B"); the file name stays in tooltips.
+const short = (name) => friendlyModelName(name);
 
 async function getJson(url, ms = 3000) {
   const ctl = new AbortController();
@@ -124,11 +126,12 @@ class CorsiaProvider {
       return [info("local", "Corsia", "starts on use", "Corsia is not running; the first message starts it with the chosen model.")];
     }
     const list = m.models.slice().sort((a, b) => (b.name === m.serving) - (a.name === m.serving));
+    const names = friendlyModelNames(m.models.map((x) => x.name));
     return list.map((x) => info(
       x.name,
-      short(x.name),
+      names.get(x.name) || short(x.name),
       x.name === m.serving ? "running" : "loads on use",
-      `${(x.bytes / 1073741824).toFixed(1)} GiB, ${x.fits ? "fits in memory" : "streams experts from the drive"}${x.name === m.serving ? "" : ". Picking it switches Corsia to this model (about a minute)."}`
+      `${x.name}\n${(x.bytes / 1073741824).toFixed(1)} GiB, ${x.fits ? "fits in memory" : "streams experts from the drive"}${x.name === m.serving ? "" : ". Picking it switches Corsia to this model (about a minute)."}`
     ));
   }
 

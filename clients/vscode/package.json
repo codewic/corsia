@@ -2,7 +2,7 @@
   "name": "corsia",
   "displayName": "Corsia",
   "description": "The models Corsia runs on this machine, in VS Code's chat: pick one in the model picker, chat and use agent mode with it.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "vorynza",
   "license": "MIT OR Apache-2.0",
   "engines": { "vscode": "^1.104.0" },

@@ -38,7 +38,7 @@ out = f"{name}-{ver}.vsix"
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     z.writestr("extension.vsixmanifest", manifest)
     z.writestr("[Content_Types].xml", types)
-    for f in ("package.json", "extension.js", "README.md"):
+    for f in ("package.json", "extension.js", "names.js", "README.md"):
         z.write(f, "extension/" + f)
 print(out)
 PY
