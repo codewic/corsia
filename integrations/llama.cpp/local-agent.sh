@@ -189,7 +189,8 @@ setup() {
   echo "4. Memory for the model"
   echo "   it needs about $(need_gib) GiB to sit in memory whole; a start now would get $(auto_cap) GiB"
   [ "$(auto_cap)" -ge "$(need_gib)" ] || echo "   less than it needs: the experts that do not fit stream from the drive (slower). Closing other programs before a start helps."
-  echo "Saved in $PROFILE. Start with: $0 start"
+  install_command | sed 's/^/   /'
+  echo "Saved in $PROFILE. Start with: corsia start"
 }
 
 # Every model is tuned to this processor once, without anyone running setup: after a start,
@@ -307,7 +308,15 @@ UNITEOF
 install_command() {
   mkdir -p "$HOME/.local/bin"
   ln -sf "$CORSIA_BIN" "$HOME/.local/bin/corsia"
-  echo "The corsia command is in ~/.local/bin (a new terminal finds it)."
+  # ~/.profile puts ~/.local/bin on the PATH for bash logins only, and only when the folder
+  # already existed; zsh never reads it. A marked block in each shell's own start file, once.
+  local rc
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    [ -f "$rc" ] || continue
+    grep -q '# corsia: ~/.local/bin on the PATH' "$rc" && continue
+    printf '\n# corsia: ~/.local/bin on the PATH\ncase ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac\n' >> "$rc"
+  done
+  echo "The corsia command is in ~/.local/bin. New terminals find it; in one already open, run: exec \"\$SHELL\""
 }
 
 case "${1:-status}" in
